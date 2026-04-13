@@ -167,6 +167,8 @@ Key knobs:
 |-------------------------------|---------------------------------------------|
 | `--patch_size_mm`             | Physical patch size — independent of native image spacing|
 | `--n_base_filters`            | Multipler of the base mix of irreps, controls feature depth              |
+| `--irrep_ratios K0 K1 K2 ...` | Per-l multiplicity ratio (default `4 2 1` → l=0,1,2). Length sets lmax. |
+| `--max_features`              | nnUNet-style cap on total features per level (default 320) |
 | `--pyramid scatter`           | Enable pyramid kernel convolution (more weight on coarse scales)           |
 | `--curriculum_bs_tiers`       | Effective batch size per curriculum phase   |
 | `--curriculum_phase_len`      | Epochs per phase                            |

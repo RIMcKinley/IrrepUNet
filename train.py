@@ -235,34 +235,49 @@ def profile_memory_on_gpu(
     cache_path = _profile_cache_path(cache_key)
     cache = _load_profile_cache(cache_path)
 
-    # Check which configs need profiling
-    configs_to_profile = []
-    n_cached = 0
+    # Check which configs need profiling.  An entry is "complete" only if it
+    # has both the training fields (mem_bs1) and the validation fields
+    # (mem_bs1_val).  Older cache entries pre-date val profiling and need to
+    # be augmented (kept; only the missing val fields are re-profiled).
+    configs_to_profile_train = []   # need full train+val profiling
+    configs_to_profile_val_only = []  # have train fields, missing val
+    n_complete = 0
     for patch_voxels, spacing in patch_configs:
         entry_key = _cache_entry_key(tuple(patch_voxels), tuple(spacing))
         if entry_key in cache:
-            # Restore from cache
             cached = cache[entry_key]
-            results[(tuple(patch_voxels), tuple(spacing))] = cached
-            n_cached += 1
+            has_val = 'mem_bs1_val' in cached or cached.get('status') in ('oom', 'oom_skipped')
+            if has_val:
+                results[(tuple(patch_voxels), tuple(spacing))] = cached
+                n_complete += 1
+            else:
+                # Train fields are present, val fields missing — keep training
+                # results, queue for val-only profile pass.
+                results[(tuple(patch_voxels), tuple(spacing))] = cached
+                configs_to_profile_val_only.append((patch_voxels, spacing))
         else:
-            configs_to_profile.append((patch_voxels, spacing))
+            configs_to_profile_train.append((patch_voxels, spacing))
 
-    if n_cached > 0:
-        print(f"\n  GPU profile cache: {n_cached}/{len(patch_configs)} configs cached (key={cache_key})")
+    if n_complete > 0:
+        print(f"\n  GPU profile cache: {n_complete}/{len(patch_configs)} configs fully cached (key={cache_key})")
+    if configs_to_profile_val_only:
+        print(f"  {len(configs_to_profile_val_only)} cached configs need val-memory back-fill")
 
-    if not configs_to_profile:
-        print(f"  All configs found in cache, skipping GPU profiling")
+    if not configs_to_profile_train and not configs_to_profile_val_only:
+        print(f"  All configs (train + val) found in cache, skipping GPU profiling")
         return results
 
     # Sort by total voxels ascending — profile small patches first, skip on OOM
-    sorted_configs = sorted(configs_to_profile, key=lambda pc: int(np.prod(pc[0])))
+    sorted_configs = sorted(configs_to_profile_train, key=lambda pc: int(np.prod(pc[0])))
+    # Val back-fills: same ordering policy
+    sorted_val_only = sorted(configs_to_profile_val_only, key=lambda pc: int(np.prod(pc[0])))
 
     # Get GPU total memory
     gpu_total_mb = torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
 
     print(f"\n  GPU profiling on {device} ({gpu_total_mb:.0f} MB total)")
-    print(f"  Profiling {len(sorted_configs)} new (patch, spacing) configurations...")
+    print(f"  Profiling {len(sorted_configs)} new (patch, spacing) configurations "
+          f"(train + val passes)...")
 
     # Build model once
     model = E3nnUNet(**model_kwargs).to(device)
@@ -279,6 +294,37 @@ def profile_memory_on_gpu(
 
     # Track OOM spacings to skip larger patches at same spacing
     oom_spacings = set()
+    oom_val_spacings = set()
+
+    def _do_val_profile(patch_voxels, spacing, spacing_key, sp_str, patch_str):
+        """Run inference bs=1, bs=2.  Returns (mem_val_bs1, mem_val_bs2, per_item_val).
+
+        Mutates oom_val_spacings on bs=1 OOM.
+        """
+        if spacing_key in oom_val_spacings:
+            return None, None, None
+        mem_val_bs1 = _profile_inference_step(
+            model, device, amp_dtype, patch_voxels, spacing,
+            n_classes, batch_size=1,
+        )
+        if mem_val_bs1 is None:
+            print(f"    {sp_str} patch={patch_str}: val OOM at bs=1")
+            oom_val_spacings.add(spacing_key)
+            return None, None, None
+        mem_val_bs2 = None
+        per_item_val = None
+        if mem_val_bs1 * 2.2 < gpu_total_mb:
+            mem_val_bs2 = _profile_inference_step(
+                model, device, amp_dtype, patch_voxels, spacing,
+                n_classes, batch_size=2,
+            )
+            if mem_val_bs2 is not None:
+                per_item_val = mem_val_bs2 - mem_val_bs1
+            else:
+                per_item_val = mem_val_bs1 * 0.85
+        else:
+            per_item_val = mem_val_bs1 * 0.85
+        return mem_val_bs1, mem_val_bs2, per_item_val
 
     for patch_voxels, spacing in sorted_configs:
         spacing_key = tuple(spacing)
@@ -287,6 +333,7 @@ def profile_memory_on_gpu(
         if spacing_key in oom_spacings:
             entry = {
                 'mem_bs1': None, 'mem_bs2': None, 'per_item': None,
+                'mem_bs1_val': None, 'mem_bs2_val': None, 'per_item_val': None,
                 'status': 'oom_skipped',
             }
             results[(tuple(patch_voxels), spacing_key)] = entry
@@ -296,7 +343,7 @@ def profile_memory_on_gpu(
         patch_str = f"{patch_voxels[0]}x{patch_voxels[1]}x{patch_voxels[2]}"
         sp_str = f"({spacing[0]:.2f},{spacing[1]:.2f},{spacing[2]:.2f})"
 
-        # Profile bs=1
+        # Profile bs=1 (training)
         mem_bs1 = _profile_single_step(
             model, optimizer, criterion, device, amp_dtype,
             patch_voxels, spacing, n_classes, batch_size=1,
@@ -308,6 +355,7 @@ def profile_memory_on_gpu(
             oom_spacings.add(spacing_key)
             entry = {
                 'mem_bs1': None, 'mem_bs2': None, 'per_item': None,
+                'mem_bs1_val': None, 'mem_bs2_val': None, 'per_item_val': None,
                 'status': 'oom',
             }
             results[(tuple(patch_voxels), spacing_key)] = entry
@@ -331,17 +379,52 @@ def profile_memory_on_gpu(
         else:
             per_item = mem_bs1 * 0.85
 
+        # Inference profile (no_grad, no backward)
+        mem_val_bs1, mem_val_bs2, per_item_val = _do_val_profile(
+            patch_voxels, spacing, spacing_key, sp_str, patch_str,
+        )
+
         entry = {
             'mem_bs1': round(mem_bs1, 1),
             'mem_bs2': round(mem_bs2, 1) if mem_bs2 is not None else None,
             'per_item': round(per_item, 1),
+            'mem_bs1_val': round(mem_val_bs1, 1) if mem_val_bs1 is not None else None,
+            'mem_bs2_val': round(mem_val_bs2, 1) if mem_val_bs2 is not None else None,
+            'per_item_val': round(per_item_val, 1) if per_item_val is not None else None,
             'status': 'ok',
         }
         results[(tuple(patch_voxels), spacing_key)] = entry
         cache[_cache_entry_key(tuple(patch_voxels), spacing_key)] = entry
 
         bs2_str = f", bs2={mem_bs2:.0f}" if mem_bs2 is not None else ""
-        print(f"    {sp_str} patch={patch_str}: bs1={mem_bs1:.0f} MB{bs2_str}, per_item={per_item:.0f} MB")
+        val_str = ""
+        if mem_val_bs1 is not None:
+            val_str = f"  |  val: bs1={mem_val_bs1:.0f}"
+            if mem_val_bs2 is not None:
+                val_str += f", bs2={mem_val_bs2:.0f}, per_item_val={per_item_val:.0f}"
+        print(f"    {sp_str} patch={patch_str}: bs1={mem_bs1:.0f} MB{bs2_str}, "
+              f"per_item={per_item:.0f}{val_str}")
+
+    # Back-fill val measurements for entries that previously had train-only data
+    for patch_voxels, spacing in sorted_val_only:
+        spacing_key = tuple(spacing)
+        entry_key = _cache_entry_key(tuple(patch_voxels), spacing_key)
+        cached = cache.get(entry_key)
+        if cached is None or cached.get('status') != 'ok':
+            continue  # nothing to back-fill (train-side OOM or missing)
+        patch_str = f"{patch_voxels[0]}x{patch_voxels[1]}x{patch_voxels[2]}"
+        sp_str = f"({spacing[0]:.2f},{spacing[1]:.2f},{spacing[2]:.2f})"
+        mem_val_bs1, mem_val_bs2, per_item_val = _do_val_profile(
+            patch_voxels, spacing, spacing_key, sp_str, patch_str,
+        )
+        cached['mem_bs1_val'] = round(mem_val_bs1, 1) if mem_val_bs1 is not None else None
+        cached['mem_bs2_val'] = round(mem_val_bs2, 1) if mem_val_bs2 is not None else None
+        cached['per_item_val'] = round(per_item_val, 1) if per_item_val is not None else None
+        results[(tuple(patch_voxels), spacing_key)] = cached
+        cache[entry_key] = cached
+        if mem_val_bs1 is not None:
+            print(f"    {sp_str} patch={patch_str}: val backfill bs1={mem_val_bs1:.0f}"
+                  + (f", bs2={mem_val_bs2:.0f}" if mem_val_bs2 is not None else ""))
 
     # Cleanup
     del model, optimizer, criterion
@@ -350,9 +433,10 @@ def profile_memory_on_gpu(
 
     # Save updated cache
     _save_profile_cache(cache_path, cache)
-    n_profiled = sum(1 for v in results.values() if v['status'] == 'ok')
     n_new = len(sorted_configs)
-    print(f"  Profiling complete: {n_new} new configs profiled, {n_cached} from cache")
+    n_backfill = len(sorted_val_only)
+    print(f"  Profiling complete: {n_new} new configs profiled, "
+          f"{n_backfill} val back-fills, {n_complete} from cache")
     print(f"  Cache saved: {cache_path} ({len(cache)} total entries)")
 
     return results
@@ -406,6 +490,55 @@ def _profile_single_step(
         del multi_seg
         torch.cuda.empty_cache()
         gc.collect()
+        return None
+
+
+def _profile_inference_step(
+    model, device, amp_dtype,
+    patch_voxels, spacing, n_classes, batch_size=1,
+):
+    """Run one forward pass under no_grad / eval mode and return peak memory in MB.
+
+    Mirrors `_profile_single_step` but skips backward + optimiser update so the
+    measurement reflects validation/inference memory (no gradient activations,
+    no optimiser state contributing to peak).
+    """
+    try:
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        x = torch.randn(batch_size, 1, *patch_voxels, device=device)
+        spacing_t = tuple(float(s) for s in spacing)
+
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                outputs = model(x, spacing=spacing_t)
+                # Force argmax + sync to mirror real val behaviour
+                if isinstance(outputs, (list, tuple)):
+                    pred = outputs[-1].argmax(dim=1)
+                else:
+                    pred = outputs.argmax(dim=1)
+                _ = pred.sum().item()  # forces device sync
+
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+
+        del x, outputs, pred
+        torch.cuda.empty_cache()
+        if was_training:
+            model.train()
+
+        return peak_mb
+
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if isinstance(e, RuntimeError) and 'out of memory' not in str(e).lower():
+            raise
+        torch.cuda.empty_cache()
+        gc.collect()
+        if was_training:
+            model.train()
         return None
 
 
@@ -523,6 +656,45 @@ class ExperimentPlanner:
             fp16=self.args.fp16,
         )
 
+    def compute_val_batch_size(self, patch_voxels: Tuple[int, int, int],
+                                spacing: Tuple[float, float, float] = None) -> int:
+        """Largest val batch size that fits the val memory target.
+
+        Uses profiled inference per-item memory when available.  Falls back to
+        the training batch size if val profiling failed for this group.
+        """
+        if not self.args.dynamic_batch_size:
+            return self.args.batch_size
+
+        # Val memory budget defaults to the training budget
+        val_target = getattr(self.args, 'val_target_memory_mb', 0) or self.args.target_memory_mb
+        if val_target <= 0:
+            return self.compute_batch_size(patch_voxels, spacing=spacing)
+
+        if hasattr(self, '_profiled_memory') and spacing is not None:
+            profile_sp = getattr(self, '_profile_spacings', {}).get(tuple(spacing), tuple(spacing))
+            key = (tuple(patch_voxels), tuple(profile_sp))
+            profile = self._profiled_memory.get(key)
+            if (profile is not None and profile.get('status') == 'ok'
+                    and profile.get('mem_bs1_val') is not None
+                    and profile.get('per_item_val') is not None):
+                mem_bs1_val = profile['mem_bs1_val']
+                per_item_val = profile['per_item_val']
+                overhead = mem_bs1_val - per_item_val
+                effective_target = val_target * 0.85  # same 15% safety margin
+                batch = 1
+                for b in range(1, self.args.max_batch_size + 1):
+                    corrected_per = per_item_val * (1.0 + 0.01 * (b - 1))
+                    est_mem = overhead + b * corrected_per
+                    if est_mem <= effective_target:
+                        batch = b
+                    else:
+                        break
+                return max(1, batch)
+
+        # No profile available — fall back to training batch size (safe)
+        return self.compute_batch_size(patch_voxels, spacing=spacing)
+
     def _create_group_config(
         self,
         group_id: int,
@@ -537,10 +709,13 @@ class ExperimentPlanner:
 
         # Compute batch size (uses profiled memory when available)
         batch_size = self.compute_batch_size(patch_voxels, spacing=spacing)
+        val_batch_size = self.compute_val_batch_size(patch_voxels, spacing=spacing)
 
         # Get memory info — prefer profiled, fall back to parametric
         measured_bs1 = None
         measured_bs2 = None
+        measured_bs1_val = None
+        measured_bs2_val = None
         if hasattr(self, '_profiled_memory'):
             profile_sp = getattr(self, '_profile_spacings', {}).get(tuple(spacing), tuple(spacing))
             key = (tuple(patch_voxels), tuple(profile_sp))
@@ -548,6 +723,8 @@ class ExperimentPlanner:
             if profile is not None and profile['status'] == 'ok':
                 measured_bs1 = profile['mem_bs1']
                 measured_bs2 = profile['mem_bs2']
+                measured_bs1_val = profile.get('mem_bs1_val')
+                measured_bs2_val = profile.get('mem_bs2_val')
                 mem_mb = measured_bs1  # Report bs=1 measured memory
             elif profile is not None and profile['status'] in ('oom', 'oom_skipped'):
                 mem_mb = float('inf')
@@ -584,6 +761,7 @@ class ExperimentPlanner:
             "patch_size_voxels": list(patch_voxels),
             "patch_size_mm": list(self.patch_size_mm),
             "batch_size": batch_size,
+            "val_batch_size": val_batch_size,
             "n_spatial_splits": n_spatial_splits,
             "estimated_memory_mb": round(mem_mb, 1) if mem_mb != float('inf') else None,
             "case_ids": cases,
@@ -600,6 +778,10 @@ class ExperimentPlanner:
             result["measured_memory_bs1"] = measured_bs1
         if measured_bs2 is not None:
             result["measured_memory_bs2"] = measured_bs2
+        if measured_bs1_val is not None:
+            result["measured_memory_bs1_val"] = measured_bs1_val
+        if measured_bs2_val is not None:
+            result["measured_memory_bs2_val"] = measured_bs2_val
 
         return result
 
@@ -1036,6 +1218,7 @@ class ExperimentPlanner:
                 "foreground_oversample": self.args.foreground_oversample,
                 "dynamic_batch_size": self.args.dynamic_batch_size,
                 "target_memory_mb": self.args.target_memory_mb,
+                "val_target_memory_mb": getattr(self.args, 'val_target_memory_mb', 0),
                 "min_batch_size": self.args.min_batch_size,
                 "max_batch_size": self.args.max_batch_size,
                 "pooling_factor": self.args.pooling_factor,
@@ -1159,6 +1342,7 @@ class ExperimentPlanner:
                 'spacing': g['spacing'],
                 'patch_size_voxels': g['patch_size_voxels'],
                 'batch_size': g['batch_size'],
+                'val_batch_size': g.get('val_batch_size', g['batch_size']),
                 'estimated_memory_mb': g.get('estimated_memory_mb') or g.get('measured_memory_bs1', 0),
                 'n_cases': len(g['case_ids']),
                 'n_spatial_splits': g.get('n_spatial_splits', 1),
@@ -1166,6 +1350,8 @@ class ExperimentPlanner:
             }
             if 'measured_memory_bs1' in g:
                 group_info['measured_memory_bs1'] = g['measured_memory_bs1']
+            if 'measured_memory_bs1_val' in g:
+                group_info['measured_memory_bs1_val'] = g['measured_memory_bs1_val']
             groups.append(group_info)
 
         # Build curriculum phases if configured
@@ -1279,6 +1465,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
     lines.append(f"Dynamic batch sizing: {args.dynamic_batch_size}")
     if args.dynamic_batch_size:
         lines.append(f"  Target memory: {args.target_memory_mb} MB")
+        val_target = getattr(args, 'val_target_memory_mb', 0) or args.target_memory_mb
+        lines.append(f"  Val target memory: {val_target} MB")
         lines.append(f"  Min effective batch: {args.min_batch_size} (via gradient accumulation)")
         lines.append(f"  Max batch: {args.max_batch_size}")
     patch_mm = tuple(args.patch_size_mm)
@@ -1305,8 +1493,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
 
     # Table header
     min_batch = getattr(args, 'min_batch_size', 1)
-    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
-    lines.append("-" * 156)
+    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
+    lines.append("-" * 162)
 
     shrunken = []
     SHRINK_TOL_MM = 4.0
@@ -1364,7 +1552,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
             patch_mm_str += "!"
             shrunken.append((spacing_str, effective_mm, shortfall))
 
-        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
+        val_bs = group.get('val_batch_size', bs)
+        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
 
     # Footnote for measured memory
     has_measured = any('measured_memory_bs1' in g for g in groups)
@@ -1834,7 +2023,8 @@ def _write_plan_validation_log(args, output_dir: Path, config_hash: str = None):
 # Training loop
 # =============================================================================
 
-def train(args, config_hash: str = None, planned_batch_sizes: dict = None):
+def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
+          planned_val_batch_sizes: dict = None):
     # Enable TF32 for matmuls — ~35% speedup on Ampere+ GPUs with negligible precision loss
     torch.set_float32_matmul_precision('high')
 
@@ -1999,6 +2189,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None):
         # No resolution filtering for validation — evaluate on all resolutions
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
         planned_batch_sizes=planned_batch_sizes,
+        planned_val_batch_sizes=planned_val_batch_sizes,
     )
     if is_main:
         print("Validation loader ready.", flush=True)
@@ -3024,6 +3215,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['foreground_oversample'] = training['foreground_oversample']
     args_dict['dynamic_batch_size'] = training.get('dynamic_batch_size', True)
     args_dict['target_memory_mb'] = training['target_memory_mb']
+    args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
     args_dict['pooling_factor'] = training['pooling_factor']
@@ -3165,6 +3357,11 @@ def main():
                                  '(default: True). Use --no-dynamic_batch_size to disable.')
     train_group.add_argument('--target_memory_mb', type=float, default=8000,
                             help='Target GPU memory in MB for dynamic batch sizing (required if --dynamic_batch_size)')
+    train_group.add_argument('--val_target_memory_mb', type=float, default=0,
+                            help='Target GPU memory in MB for validation batch sizing. '
+                                 'Default 0 → reuse --target_memory_mb. Validation typically '
+                                 'fits a larger batch than training at the same memory budget '
+                                 '(no gradients/optimiser state).')
     train_group.add_argument('--min_batch_size', type=int, default=1,
                             help='Minimum effective batch size (default: 1). Groups with smaller '
                                  'GPU batch size accumulate gradients to reach this.')
@@ -3327,6 +3524,7 @@ def main():
     # Load from config file if provided
     config_hash = None
     planned_batch_sizes = None
+    planned_val_batch_sizes = None
 
     if args.config:
         print(f"Loading experiment configuration from {args.config}")
@@ -3354,12 +3552,17 @@ def main():
                 args.wandb_name = cli_wandb_name
 
         # Extract planned batch sizes from loader_groups
+        planned_val_batch_sizes = {}
         if 'loader_groups' in config:
             planned_batch_sizes = {}
             for group in config['loader_groups']:
                 spacing_key = tuple(float(s) for s in group['spacing'])
                 planned_batch_sizes[spacing_key] = group['batch_size']
-            print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups")
+                if 'val_batch_size' in group:
+                    planned_val_batch_sizes[spacing_key] = group['val_batch_size']
+            print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups"
+                  + (f" (+ {len(planned_val_batch_sizes)} val-specific)"
+                     if planned_val_batch_sizes else ""))
 
         print(f"Configuration loaded successfully")
     else:
@@ -3371,7 +3574,8 @@ def main():
             print("Error: --output_dir is required (or provide --config)", file=sys.stderr)
             sys.exit(1)
 
-    train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes)
+    train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes,
+          planned_val_batch_sizes=planned_val_batch_sizes)
 
 
 if __name__ == '__main__':

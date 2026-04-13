@@ -83,6 +83,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['foreground_oversample'] = training['foreground_oversample']
     args_dict['dynamic_batch_size'] = training.get('dynamic_batch_size', True)
     args_dict['target_memory_mb'] = training['target_memory_mb']
+    args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
     args_dict['pooling_factor'] = training['pooling_factor']
@@ -443,8 +444,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
     lines.append("-" * 120)
 
     min_batch = getattr(args, 'min_batch_size', 1)
-    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
-    lines.append("-" * 156)
+    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
+    lines.append("-" * 162)
 
     shrunken = []  # (spacing_str, effective_mm, shortfall)
     SHRINK_TOL_MM = 4.0
@@ -492,7 +493,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
             patch_mm_str = patch_mm_str + "!"
             shrunken.append((spacing_str, effective_mm, shortfall))
 
-        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
+        val_bs = group.get('val_batch_size', bs)
+        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
 
     has_measured = any('measured_memory_bs1' in g for g in groups)
     if has_measured:

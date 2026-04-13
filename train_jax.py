@@ -397,7 +397,8 @@ def validate_epoch(model, val_loader, n_classes, val_patches, fp16,
 # Training loop
 # =============================================================================
 
-def train(args, config_hash=None, planned_batch_sizes=None):
+def train(args, config_hash=None, planned_batch_sizes=None,
+          planned_val_batch_sizes=None):
     """Main training function.
 
     Parameters
@@ -515,6 +516,7 @@ def train(args, config_hash=None, planned_batch_sizes=None):
         n_downsample=args.n_downsample,
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
         planned_batch_sizes=planned_batch_sizes,
+        planned_val_batch_sizes=planned_val_batch_sizes,
     )
     print("Validation loader ready.", flush=True)
 
@@ -1470,6 +1472,7 @@ def main():
     # Load from config file if provided
     config_hash = None
     planned_batch_sizes = None
+    planned_val_batch_sizes = None
 
     if args.config:
         print(f"Loading experiment configuration from {args.config}")
@@ -1509,12 +1512,17 @@ def main():
             args.gpu = cli_gpu
 
         # Extract planned batch sizes from loader_groups
+        planned_val_batch_sizes = {}
         if 'loader_groups' in config:
             planned_batch_sizes = {}
             for group in config['loader_groups']:
                 spacing_key = tuple(float(s) for s in group['spacing'])
                 planned_batch_sizes[spacing_key] = group['batch_size']
-            print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups")
+                if 'val_batch_size' in group:
+                    planned_val_batch_sizes[spacing_key] = group['val_batch_size']
+            print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups"
+                  + (f" (+ {len(planned_val_batch_sizes)} val-specific)"
+                     if planned_val_batch_sizes else ""))
 
         print(f"Configuration loaded successfully")
     else:
@@ -1545,7 +1553,8 @@ def main():
     print(f"JAX devices: {devices}")
     print(f"JAX backend: {jax.default_backend()}")
 
-    train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes)
+    train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes,
+          planned_val_batch_sizes=planned_val_batch_sizes)
 
 
 if __name__ == '__main__':

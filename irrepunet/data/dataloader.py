@@ -384,6 +384,7 @@ class MultiResolutionLoader:
         superres_weight: float = 0.1,
         group_balance: float = 0.0,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
+        planned_val_batch_sizes: Optional[Dict[tuple, int]] = None,
         rank: int = 0,
         world_size: int = 1,
         sync_groups: bool = False,
@@ -406,6 +407,10 @@ class MultiResolutionLoader:
         self.subsample_weight = subsample_weight
         self.model_scale = model_scale
         self.planned_batch_sizes = planned_batch_sizes or {}
+        # Optional validation-specific batch sizes (sized for inference memory,
+        # typically larger than training).  When non-empty, _compute_batch_size
+        # prefers these over `planned_batch_sizes`.
+        self.planned_val_batch_sizes = planned_val_batch_sizes or {}
 
         # --- Load all .pkl metadata once ---
         properties = {}
@@ -479,13 +484,21 @@ class MultiResolutionLoader:
             group_batch_size = self._compute_batch_size(
                 patch_size_voxels, spacing=spacing,
             )
-            if spacing in self.planned_batch_sizes:
-                planned_bs = self.planned_batch_sizes[spacing]
+            # Use val plan if present; else train plan
+            ref_planned = (self.planned_val_batch_sizes
+                           if spacing in self.planned_val_batch_sizes
+                           else self.planned_batch_sizes)
+            if spacing in ref_planned:
+                planned_bs = ref_planned[spacing]
                 if group_batch_size != planned_bs:
                     print(f"    Using planned batch size {planned_bs} for {spacing}")
             elif self.planned_batch_sizes:
-                skipped_groups.append((spacing, f"not in planned batch sizes"))
-                continue
+                # Spacing not in the planned dict (e.g. exceeded the planning
+                # memory budget, or new data added since planning).  Include
+                # it anyway with bs=1 — silent exclusion masks bugs and breaks
+                # validation coverage.  If bs=1 OOMs, the user sees it directly.
+                group_batch_size = 1
+                print(f"    Using batch size 1 for unplanned spacing {spacing}")
 
             n_orig = sum(1 for c in cases if c not in self.subsampled_cases)
             n_sub = sum(1 for c in cases if c in self.subsampled_cases)
@@ -651,9 +664,14 @@ class MultiResolutionLoader:
     def _compute_batch_size(self, patch_size_voxels: tuple, spacing: tuple = None) -> int:
         """Compute batch size for a given patch size.
 
-        If planned_batch_sizes contains the spacing, uses the planned value
-        directly. Otherwise falls back to estimation.
+        Priority:
+        1. ``planned_val_batch_sizes[spacing]`` (val loader, when set)
+        2. ``planned_batch_sizes[spacing]`` (training-sized)
+        3. dynamic estimation
+        4. ``self.batch_size`` fallback
         """
+        if spacing is not None and spacing in self.planned_val_batch_sizes:
+            return self.planned_val_batch_sizes[spacing]
         if spacing is not None and spacing in self.planned_batch_sizes:
             return self.planned_batch_sizes[spacing]
 
