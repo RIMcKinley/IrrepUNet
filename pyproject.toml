@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests", "tests_jax"]
+markers = [
+    "gpu: marks tests requiring CUDA GPU (deselect with '-m \"not gpu\"')",
+    "data: marks tests requiring preprocessed data on disk (deselect with '-m \"not data\"')",
+    "slow: marks tests that take >30s (deselect with '-m \"not slow\"')",
+]
+timeout = 120

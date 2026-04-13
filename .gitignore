@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Experiment outputs / checkpoints / caches
+experiments/
+wandb/
+.wandb/
+.xla_compilation_cache/
+.xla_split_jit_cache/
+.xla_*/
+.gpu_profile_cache/
+
+# Checkpoints, artefacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npy
+*.npz
+
+# Medical imaging data — never commit
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.raw
+*.dcm
+
+# Logs
+*.log
+/tmp/*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Plots and generated figures
+*.png
+*.jpg
+*.jpeg
+*.pdf
