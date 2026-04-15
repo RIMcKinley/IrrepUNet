@@ -75,16 +75,55 @@ def _needs_projection(model):
 
 
 def _compute_padding(dim, patch, step):
-    """Compute reflect-padding for a perfectly regular patch grid.
+    """[Legacy] Compute reflect-padding for a perfectly regular patch grid.
 
-    Without padding, the last patch snaps back to (dim - patch), creating
-    irregular overlap and position-dependent Gaussian weighting. This
-    computes the minimum padding so every position is exactly step apart.
+    Kept for callers that still want the old "fixed step + reflect-pad"
+    behaviour; new code should use ``_patch_starts`` instead.
     """
     if dim <= patch:
         return 0
-    n_steps = -(-(dim - patch) // step)  # ceil division
+    n_steps = -(-(dim - patch) // step)
     return patch + n_steps * step - dim
+
+
+def _patch_starts(dim, patch, max_step):
+    """Compute patch start positions covering ``[0, dim)`` with overlap as a
+    minimum constraint (``max_step = patch * (1 - min_overlap)``).
+
+    When ``dim > patch`` the patches are distributed evenly so the actual
+    stride between consecutive starts is ``(dim - patch) / (n - 1) <=
+    max_step``; the volume needs **no** padding.  When ``dim <= patch`` a
+    single patch is used and the volume must be reflect-padded by
+    ``patch - dim`` to fill the patch.
+
+    The starts are constructed by rounding the first half of the positions
+    and mirroring them to the second half, so the set of positions is
+    symmetric under volume reflection (modulo at most a 1-voxel rounding
+    error at the centre when both ``n`` and ``travel`` are odd).  This
+    avoids subtle anterior/posterior or left/right sampling biases.
+
+    Returns
+    -------
+    starts : list of int
+        Patch start positions.
+    pad : int
+        Padding to add so the patches fit (only nonzero when ``dim <= patch``).
+    """
+    if dim <= patch:
+        return [0], patch - dim
+    n_steps = (dim - patch + max_step - 1) // max_step  # ceil
+    n = n_steps + 1
+    if n <= 1:
+        return [0], 0
+    travel = dim - patch
+    # Round first half from index 0; mirror to second half.  This guarantees
+    # ``starts[i] + starts[n-1-i] == travel`` for all i ≠ middle.
+    starts = [0] * n
+    for i in range((n + 1) // 2):
+        s = round(i * travel / (n - 1))
+        starts[i] = s
+        starts[n - 1 - i] = travel - s
+    return starts, 0
 
 
 # =============================================================================
@@ -163,16 +202,18 @@ def sliding_window_inference(
     pd, ph, pw = patch_voxels
     D, H, W = img_shape
 
-    # Compute step sizes and padding for regular grid
-    step_d = max(1, int(pd * (1 - overlap)))
-    step_h = max(1, int(ph * (1 - overlap)))
-    step_w = max(1, int(pw * (1 - overlap)))
+    # Patch positions: overlap is treated as a *minimum*; patches are
+    # distributed evenly within each dimension so no reflect-padding is
+    # needed when the volume is at least the patch size.
+    max_step_d = max(1, int(pd * (1 - overlap)))
+    max_step_h = max(1, int(ph * (1 - overlap)))
+    max_step_w = max(1, int(pw * (1 - overlap)))
 
-    total_pad_d = _compute_padding(D, pd, step_d)
-    total_pad_h = _compute_padding(H, ph, step_h)
-    total_pad_w = _compute_padding(W, pw, step_w)
+    d_positions, total_pad_d = _patch_starts(D, pd, max_step_d)
+    h_positions, total_pad_h = _patch_starts(H, ph, max_step_h)
+    w_positions, total_pad_w = _patch_starts(W, pw, max_step_w)
 
-    # Symmetric reflect-pad
+    # Pad only the dimensions where the volume is smaller than the patch.
     pad_d0, pad_d1 = total_pad_d // 2, total_pad_d - total_pad_d // 2
     pad_h0, pad_h1 = total_pad_h // 2, total_pad_h - total_pad_h // 2
     pad_w0, pad_w1 = total_pad_w // 2, total_pad_w - total_pad_w // 2
@@ -185,12 +226,10 @@ def sliding_window_inference(
             mode='reflect',
         ).squeeze(0)
 
+    # Patch positions returned by _patch_starts are relative to the original
+    # volume. When dim <= patch the padded volume is exactly the patch size
+    # so the [0] start covers it exactly; no re-anchoring needed.
     Dp, Hp, Wp = image_tensor.shape[1:]
-
-    # Regular grid patch positions (no boundary snapping)
-    d_positions = list(range(0, Dp - pd + 1, step_d))
-    h_positions = list(range(0, Hp - ph + 1, step_h))
-    w_positions = list(range(0, Wp - pw + 1, step_w))
 
     patch_locs = [(d, h, w)
                   for d in d_positions for h in h_positions for w in w_positions]

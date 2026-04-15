@@ -371,6 +371,7 @@ def run_validation(
     no_train_counts=False,
     mirror_tta=False,
     native_e3nn=False,
+    patch_size_mm=None,
 ):
     """Run full-volume validation on all validation cases.
 
@@ -418,6 +419,8 @@ def run_validation(
             suffixes.append('native')
         if mirror_tta:
             suffixes.append('mirror')
+        if patch_size_mm is not None:
+            suffixes.append('patch' + 'x'.join(f'{int(p)}' for p in patch_size_mm))
         tta_suffix = '_' + '_'.join(suffixes) if suffixes else ''
         output = f'val_{stem}{tta_suffix}.json'
 
@@ -447,9 +450,18 @@ def run_validation(
         val_cases = splits[fold]['val']
 
     training_config = config.get('training', config)
-    patch_mm = training_config.get('patch_size_mm', [80, 80, 80])
-    if isinstance(patch_mm, list):
-        patch_mm = patch_mm[0]
+    if patch_size_mm is not None:
+        # CLI override — keep as a tuple (may be anisotropic)
+        patch_mm = tuple(float(p) for p in patch_size_mm)
+        print(f"Patch size mm override: {patch_mm}")
+    else:
+        patch_mm = training_config.get('patch_size_mm', [80, 80, 80])
+        if isinstance(patch_mm, list):
+            # Use full tuple if anisotropic, scalar if all equal
+            if len(set(patch_mm)) == 1:
+                patch_mm = patch_mm[0]
+            else:
+                patch_mm = tuple(float(p) for p in patch_mm)
 
     # Model params for dynamic sw_batch_size estimation
     model_config = config.get('model', config)
@@ -571,7 +583,11 @@ def run_validation(
             seg = seg[0]
 
         # Dynamic sw_batch_size: estimate from patch voxels and GPU memory
-        patch_voxels = tuple(max(1, int(round(patch_mm / s))) for s in spacing)
+        # patch_mm may be a scalar or 3-tuple
+        if isinstance(patch_mm, (tuple, list)):
+            patch_voxels = tuple(max(1, int(round(p / s))) for p, s in zip(patch_mm, spacing))
+        else:
+            patch_voxels = tuple(max(1, int(round(patch_mm / s))) for s in spacing)
         case_sw_batch = estimate_batch_size(
             patch_voxels, n_base_filters, target_memory_mb,
             min_batch=1, max_batch=sw_batch_size,
@@ -703,6 +719,10 @@ def main():
     parser.add_argument('--native_e3nn', action='store_true',
                         help='Native e3nn inference: skip projection, pass spacing at forward time. '
                              'Required for runtime pyramid cap control.')
+    parser.add_argument('--patch_size_mm', type=float, nargs='+', default=None,
+                        help='Override the patch size (mm) used for sliding window inference. '
+                             'Pass 1 value (isotropic) or 3 values (D H W). '
+                             'Default: take from training config.')
     args = parser.parse_args()
 
     run_validation(
@@ -717,6 +737,7 @@ def main():
         no_train_counts=args.no_train_counts,
         mirror_tta=args.mirror_tta,
         native_e3nn=args.native_e3nn,
+        patch_size_mm=args.patch_size_mm,
     )
 
 

@@ -86,6 +86,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
+    args_dict['min_bottleneck_voxels'] = training.get('min_bottleneck_voxels', 1)
     args_dict['pooling_factor'] = training['pooling_factor']
     args_dict['resolution_jitter_sigma'] = training['resolution_jitter_sigma']
     args_dict['scale_jitter_std'] = training.get('scale_jitter_std', 0.0)

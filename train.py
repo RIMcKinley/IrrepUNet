@@ -542,6 +542,61 @@ def _profile_inference_step(
         return None
 
 
+def _axis_groups(spacing, tol=0.1):
+    """Group axes by similar spacing, ordered thick → thin.
+
+    Two axes belong to the same group when ``|sp_a - sp_b| / max(sp_a, sp_b)
+    < tol``.  Used by per-group patch-shrinking to keep in-plane axes
+    isotropic when reducing the patch size.
+
+    Returns a list of lists of axis indices (0..2), with the thickest group
+    first.  E.g. ``(0.25, 0.25, 4) → [[2], [0, 1]]``.
+    """
+    pairs = sorted(enumerate(spacing), key=lambda x: -x[1])  # thick → thin
+    groups = [[pairs[0][0]]]
+    cur_sp = pairs[0][1]
+    for axis, sp in pairs[1:]:
+        if cur_sp > 0 and abs(sp - cur_sp) / cur_sp < tol:
+            groups[-1].append(axis)
+        else:
+            groups.append([axis])
+            cur_sp = sp
+    return groups
+
+
+def _per_axis_pool_factors(spacing, n_downsample, model_scale):
+    """Cumulative pool factor per axis, replicating ``mm_to_voxels`` logic."""
+    from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
+    final_sp = compute_steps_through_pooling(spacing, n_downsample, model_scale)[-1]
+    return tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
+
+
+def _shrink_patch_mm_one_step(current_mm, voxels, spacing, axis_groups,
+                              pool_factors, min_bottleneck=1):
+    """Shrink the thickest axis-group where every axis can still shrink.
+
+    Returns the new patch_mm tuple, or ``None`` if no group can shrink
+    further.  All axes in a group shrink together by one pool-factor unit
+    each (keeps in-plane isotropic).
+    """
+    new_mm = list(current_mm)
+    for group in axis_groups:  # thick → thin
+        proposed = {}
+        ok = True
+        for axis in group:
+            cur_v = (voxels[axis] // pool_factors[axis]) * pool_factors[axis]
+            nv = cur_v - pool_factors[axis]
+            if nv < pool_factors[axis] * min_bottleneck:
+                ok = False
+                break
+            proposed[axis] = nv
+        if ok:
+            for axis, nv in proposed.items():
+                new_mm[axis] = nv * spacing[axis]
+            return tuple(new_mm)
+    return None  # exhausted
+
+
 class ExperimentPlanner:
     """Plans training experiments without executing them."""
 
@@ -578,7 +633,8 @@ class ExperimentPlanner:
 
         return metadata
 
-    def compute_patch_size_voxels(self, spacing: Tuple[float, float, float]) -> Tuple[int, int, int]:
+    def compute_patch_size_voxels(self, spacing: Tuple[float, float, float],
+                                  patch_size_mm: Optional[Tuple[float, float, float]] = None) -> Tuple[int, int, int]:
         """Convert mm patch size to voxels for a given spacing.
 
         Uses the same algorithm as MultiResolutionLoader._mm_to_voxels():
@@ -587,13 +643,16 @@ class ExperimentPlanner:
 
         Args:
             spacing: Voxel spacing in mm (D, H, W)
+            patch_size_mm: Optional per-group patch size override.  Defaults
+                to the planner's ``self.patch_size_mm``.
 
         Returns:
             Patch size in voxels (D, H, W)
         """
         model_scale = getattr(self.args, 'scale', 2.0)
+        target_mm = patch_size_mm if patch_size_mm is not None else self.patch_size_mm
         return mm_to_voxels(
-            self.patch_size_mm, spacing,
+            target_mm, spacing,
             self.args.n_downsample, model_scale,
         )
 
@@ -695,6 +754,63 @@ class ExperimentPlanner:
         # No profile available — fall back to training batch size (safe)
         return self.compute_batch_size(patch_voxels, spacing=spacing)
 
+    def _shrink_to_fit(self, spacing, target_mm, target_mem_mb,
+                       profile_fn, max_iter=20):
+        """Iteratively shrink ``patch_size_mm`` until bs=1 fits target memory.
+
+        Strategy (anisotropic, "thick first"):
+          - Group axes by spacing similarity (in-plane treated together).
+          - At each step shrink the thickest still-shrinkable group by one
+            pool-factor unit per axis.
+          - Stop when bs=1 fits, or when no group can shrink further while
+            keeping ``min_bottleneck`` voxels at the bottleneck of every axis.
+
+        Parameters
+        ----------
+        spacing : tuple
+            Group canonical spacing.
+        target_mm : tuple
+            Initial patch size in mm (e.g. user's --patch_size_mm).
+        target_mem_mb : float
+            Memory budget for bs=1 (already includes safety margin).
+        profile_fn : callable(patch_voxels, spacing, batch_size) -> mem_mb or None
+            Returns peak GPU memory in MB for one fwd+bwd at the given config,
+            or ``None`` on OOM.
+
+        Returns
+        -------
+        (final_mm, final_voxels, final_mem) : tuple
+            ``final_mem`` is ``None`` if no shrunken patch fits.
+        """
+        n_down = self.args.n_downsample
+        model_scale = getattr(self.args, 'scale', 2.0)
+        min_bot = getattr(self.args, 'min_bottleneck_voxels', 1)
+
+        groups = _axis_groups(spacing)
+        pool_factors = _per_axis_pool_factors(spacing, n_down, model_scale)
+
+        current_mm = tuple(target_mm)
+        attempts = []
+
+        for it in range(max_iter):
+            voxels = mm_to_voxels(current_mm, spacing, n_down, model_scale)
+            mem = profile_fn(voxels, spacing, 1)
+            attempts.append((current_mm, voxels, mem))
+            if mem is not None and mem <= target_mem_mb:
+                return current_mm, voxels, mem
+            new_mm = _shrink_patch_mm_one_step(
+                current_mm, voxels, spacing, groups, pool_factors,
+                min_bottleneck=min_bot,
+            )
+            if new_mm is None:
+                break  # exhausted
+            current_mm = new_mm
+
+        # No fit found — return the smallest attempt
+        if attempts:
+            return attempts[-1]
+        return current_mm, voxels, None
+
     def _create_group_config(
         self,
         group_id: int,
@@ -702,10 +818,16 @@ class ExperimentPlanner:
         cases: List[str],
         subsampled_cases: Optional[set] = None,
         n_spatial_splits: int = 1,
+        patch_size_mm: Optional[Tuple[float, float, float]] = None,
     ) -> Dict:
-        """Create configuration for a single loader group."""
-        # Compute patch size in voxels
-        patch_voxels = self.compute_patch_size_voxels(spacing)
+        """Create configuration for a single loader group.
+
+        ``patch_size_mm`` overrides the planner's global patch size for this
+        group only (used when the global size was shrunk to fit memory).
+        """
+        # Compute patch size in voxels (per-group mm if provided)
+        group_patch_mm = patch_size_mm if patch_size_mm is not None else self.patch_size_mm
+        patch_voxels = self.compute_patch_size_voxels(spacing, patch_size_mm=group_patch_mm)
 
         # Compute batch size (uses profiled memory when available)
         batch_size = self.compute_batch_size(patch_voxels, spacing=spacing)
@@ -759,7 +881,7 @@ class ExperimentPlanner:
             "group_id": group_id,
             "spacing": list(spacing),
             "patch_size_voxels": list(patch_voxels),
-            "patch_size_mm": list(self.patch_size_mm),
+            "patch_size_mm": list(group_patch_mm),
             "batch_size": batch_size,
             "val_batch_size": val_batch_size,
             "n_spatial_splits": n_spatial_splits,
@@ -1068,9 +1190,92 @@ class ExperimentPlanner:
                     print(f"    {sp}: kept {n_kept}/{n_orig} cases ({n_excl} excluded), "
                           f"worst kept ratio {ratio:.2f}x")
 
+        # Per-group patch-mm shrinking: groups whose bs=1 still exceeds the
+        # memory budget are NOT dropped — instead, shrink their patch_size_mm
+        # anisotropically (thick axis first; in-plane axes shrink together)
+        # until bs=1 fits, or until shrinking is exhausted.
+        per_group_patch_mm = {}  # spacing → (d, h, w) mm
+        if torch.cuda.is_available() and self._profiled_memory:
+            effective_target = self.args.target_memory_mb * 0.85
+            shrink_candidates = []
+            for spacing, cases in eligible_groups:
+                patch_voxels = self.compute_patch_size_voxels(spacing)
+                profile_sp = self._profile_spacings.get(spacing, spacing)
+                key = (tuple(patch_voxels), tuple(profile_sp))
+                profile = self._profiled_memory.get(key)
+                if profile is None:
+                    continue
+                if profile['status'] in ('oom', 'oom_skipped'):
+                    shrink_candidates.append((spacing, cases, profile_sp))
+                elif profile['status'] == 'ok' and profile['mem_bs1'] > effective_target:
+                    shrink_candidates.append((spacing, cases, profile_sp))
+
+            if shrink_candidates:
+                print(f"\n  Per-group patch shrinking: {len(shrink_candidates)} groups exceed "
+                      f"effective target {effective_target:.0f} MB at the requested "
+                      f"patch_size_mm={tuple(self.patch_size_mm)}")
+
+                # Build a single model + optimiser for repeated profiling
+                from irrepunet.training.losses import DiceCELoss, DeepSupervisionLoss
+                base_criterion = DiceCELoss(ce_weight=1.0, dice_weight=1.0)
+                if self.args.deep_supervision:
+                    criterion = DeepSupervisionLoss(base_loss=base_criterion,
+                                                    n_scales=self.args.n_downsample)
+                else:
+                    criterion = base_criterion
+                amp_dtype = torch.bfloat16 if self.args.fp16 else torch.float32
+                shrink_model = E3nnUNet(**model_kwargs).to(device)
+                shrink_optimizer = AdamW(shrink_model.parameters(),
+                                         lr=0.01, weight_decay=3e-5)
+
+                def _profile_shrunk(patch_voxels, sp, batch_size):
+                    return _profile_single_step(
+                        shrink_model, shrink_optimizer, criterion, device, amp_dtype,
+                        patch_voxels, sp, model_kwargs['n_classes'],
+                        batch_size=batch_size,
+                        deep_supervision=self.args.deep_supervision,
+                    )
+
+                for spacing, cases, profile_sp in shrink_candidates:
+                    final_mm, final_voxels, final_mem = self._shrink_to_fit(
+                        spacing=profile_sp,
+                        target_mm=tuple(self.patch_size_mm),
+                        target_mem_mb=effective_target,
+                        profile_fn=_profile_shrunk,
+                        max_iter=20,
+                    )
+                    sp_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+                    if final_mem is not None and final_mem <= effective_target:
+                        per_group_patch_mm[spacing] = final_mm
+                        # Cache the new profile so _create_group_config picks it up
+                        self._profiled_memory[(tuple(final_voxels), tuple(profile_sp))] = {
+                            'mem_bs1': round(final_mem, 1),
+                            'mem_bs2': None,
+                            'per_item': round(final_mem * 0.85, 1),  # heuristic
+                            'mem_bs1_val': None,
+                            'mem_bs2_val': None,
+                            'per_item_val': None,
+                            'status': 'ok',
+                        }
+                        print(f"    {sp_str}: shrunk to "
+                              f"({final_mm[0]:.0f}, {final_mm[1]:.0f}, {final_mm[2]:.0f}) mm "
+                              f"= voxels {tuple(final_voxels)}, mem={final_mem:.0f} MB")
+                    else:
+                        # Shrinking exhausted — keep at smallest tried; will fall back
+                        # to bs=1 in the loader (or get filtered if still OOM).
+                        per_group_patch_mm[spacing] = final_mm
+                        print(f"    {sp_str}: SHRINK EXHAUSTED at "
+                              f"({final_mm[0]:.0f}, {final_mm[1]:.0f}, {final_mm[2]:.0f}) mm "
+                              f"(still OOM at bs=1)")
+
+                # Free the dedicated shrink-profile model
+                del shrink_model, shrink_optimizer, criterion
+                torch.cuda.empty_cache()
+
         # Create group configs using profiled memory
         for spacing, cases in eligible_groups:
-            patch_voxels = self.compute_patch_size_voxels(spacing)
+            group_patch_mm = per_group_patch_mm.get(spacing, tuple(self.patch_size_mm))
+            patch_voxels = self.compute_patch_size_voxels(spacing, patch_size_mm=group_patch_mm)
             profile_sp = self._profile_spacings.get(spacing, spacing)
             key = (tuple(patch_voxels), tuple(profile_sp))
             profile = self._profiled_memory.get(key)
@@ -1126,6 +1331,7 @@ class ExperimentPlanner:
                 cases=cases,
                 subsampled_cases=subsampled_cases if subsampled_cases else None,
                 n_spatial_splits=n_spatial_splits,
+                patch_size_mm=group_patch_mm,
             )
             loader_groups.append(real_config)
 
@@ -1221,6 +1427,7 @@ class ExperimentPlanner:
                 "val_target_memory_mb": getattr(self.args, 'val_target_memory_mb', 0),
                 "min_batch_size": self.args.min_batch_size,
                 "max_batch_size": self.args.max_batch_size,
+                "min_bottleneck_voxels": getattr(self.args, 'min_bottleneck_voxels', 1),
                 "pooling_factor": self.args.pooling_factor,
                 "resolution_jitter_sigma": self.args.resolution_jitter_sigma,
                 "scale_jitter_std": getattr(self.args, 'scale_jitter_std', 0.0),
@@ -2024,7 +2231,8 @@ def _write_plan_validation_log(args, output_dir: Path, config_hash: str = None):
 # =============================================================================
 
 def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
-          planned_val_batch_sizes: dict = None):
+          planned_val_batch_sizes: dict = None,
+          planned_patch_sizes_mm: dict = None):
     # Enable TF32 for matmuls — ~35% speedup on Ampere+ GPUs with negligible precision loss
     torch.set_float32_matmul_precision('high')
 
@@ -2133,6 +2341,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         superres_weight=getattr(args, 'superres_weight', 0.1),
         group_balance=getattr(args, 'group_balance', 0.0),
         planned_batch_sizes=planned_batch_sizes,
+        planned_patch_sizes_mm=planned_patch_sizes_mm,
         rank=rank,
         world_size=world_size,
         sync_groups=distributed and getattr(args, 'ddp_sync_groups', False),
@@ -2190,6 +2399,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
         planned_batch_sizes=planned_batch_sizes,
         planned_val_batch_sizes=planned_val_batch_sizes,
+        planned_patch_sizes_mm=planned_patch_sizes_mm,
     )
     if is_main:
         print("Validation loader ready.", flush=True)
@@ -3218,6 +3428,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
+    args_dict['min_bottleneck_voxels'] = training.get('min_bottleneck_voxels', 1)
     args_dict['pooling_factor'] = training['pooling_factor']
     args_dict['resolution_jitter_sigma'] = training['resolution_jitter_sigma']
     args_dict['scale_jitter_std'] = training.get('scale_jitter_std', 0.0)
@@ -3367,6 +3578,10 @@ def main():
                                  'GPU batch size accumulate gradients to reach this.')
     train_group.add_argument('--max_batch_size', type=int, default=24,
                             help='Maximum batch size for dynamic sizing (default: 32)')
+    train_group.add_argument('--min_bottleneck_voxels', type=int, default=1,
+                            help='Lower bound (in bottleneck voxels per axis) when per-group '
+                                 'patch shrinking is allowed to reduce memory.  1 = patch may '
+                                 'collapse to a single bottleneck voxel per axis.  Default 1.')
     train_group.add_argument('--lr', type=float, default=0.01,
                             help='Learning rate (default: 0.01)')
     train_group.add_argument('--weight_decay', type=float, default=3e-5,
@@ -3525,6 +3740,7 @@ def main():
     config_hash = None
     planned_batch_sizes = None
     planned_val_batch_sizes = None
+    planned_patch_sizes_mm = None
 
     if args.config:
         print(f"Loading experiment configuration from {args.config}")
@@ -3551,8 +3767,10 @@ def main():
             if cli_wandb_name:
                 args.wandb_name = cli_wandb_name
 
-        # Extract planned batch sizes from loader_groups
+        # Extract planned batch sizes and per-group patch sizes from loader_groups
         planned_val_batch_sizes = {}
+        planned_patch_sizes_mm = {}
+        global_patch_mm = tuple(float(p) for p in config['training']['patch_size_mm'])
         if 'loader_groups' in config:
             planned_batch_sizes = {}
             for group in config['loader_groups']:
@@ -3560,9 +3778,17 @@ def main():
                 planned_batch_sizes[spacing_key] = group['batch_size']
                 if 'val_batch_size' in group:
                     planned_val_batch_sizes[spacing_key] = group['val_batch_size']
+                # Per-group patch size — only record if it differs from global
+                if 'patch_size_mm' in group:
+                    g_mm = tuple(float(p) for p in group['patch_size_mm'])
+                    if g_mm != global_patch_mm:
+                        planned_patch_sizes_mm[spacing_key] = g_mm
+            shrunk_n = len(planned_patch_sizes_mm)
             print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups"
                   + (f" (+ {len(planned_val_batch_sizes)} val-specific)"
-                     if planned_val_batch_sizes else ""))
+                     if planned_val_batch_sizes else "")
+                  + (f" ({shrunk_n} groups with shrunk patch_size_mm)"
+                     if shrunk_n else ""))
 
         print(f"Configuration loaded successfully")
     else:
@@ -3575,7 +3801,8 @@ def main():
             sys.exit(1)
 
     train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes,
-          planned_val_batch_sizes=planned_val_batch_sizes)
+          planned_val_batch_sizes=planned_val_batch_sizes,
+          planned_patch_sizes_mm=planned_patch_sizes_mm)
 
 
 if __name__ == '__main__':

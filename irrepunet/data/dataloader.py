@@ -385,6 +385,7 @@ class MultiResolutionLoader:
         group_balance: float = 0.0,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
         planned_val_batch_sizes: Optional[Dict[tuple, int]] = None,
+        planned_patch_sizes_mm: Optional[Dict[tuple, tuple]] = None,
         rank: int = 0,
         world_size: int = 1,
         sync_groups: bool = False,
@@ -411,6 +412,10 @@ class MultiResolutionLoader:
         # typically larger than training).  When non-empty, _compute_batch_size
         # prefers these over `planned_batch_sizes`.
         self.planned_val_batch_sizes = planned_val_batch_sizes or {}
+        # Optional per-group patch_size_mm overrides (planner shrunk these
+        # groups to fit memory).  When set, the per-group mm is used instead
+        # of the global ``patch_size_mm`` for that spacing's mm_to_voxels call.
+        self.planned_patch_sizes_mm = planned_patch_sizes_mm or {}
 
         # --- Load all .pkl metadata once ---
         properties = {}
@@ -477,8 +482,11 @@ class MultiResolutionLoader:
                 )
                 continue
 
+            # Per-group patch_size_mm if the planner shrunk this group;
+            # otherwise the global request.
+            group_patch_mm = self.planned_patch_sizes_mm.get(spacing, patch_size_mm)
             patch_size_voxels = mm_to_voxels(
-                patch_size_mm, spacing, n_downsample, model_scale,
+                group_patch_mm, spacing, n_downsample, model_scale,
             )
 
             group_batch_size = self._compute_batch_size(
@@ -536,8 +544,10 @@ class MultiResolutionLoader:
             # requested patch_size_mm can't be represented exactly, the
             # effective physical patch is smaller than requested.
             effective_mm = tuple(v * s for v, s in zip(patch_size_voxels, spacing))
+            # Compare to the per-group request (which may itself be smaller
+            # than the global mm if the planner shrunk this group).
             shortfall = tuple(
-                max(0.0, rmm - emm) for rmm, emm in zip(patch_size_mm, effective_mm)
+                max(0.0, rmm - emm) for rmm, emm in zip(group_patch_mm, effective_mm)
             )
             is_shrunken = any(sh > SHRINK_TOL_MM for sh in shortfall)
             if is_shrunken:
