@@ -53,8 +53,16 @@ def make_gaussian_importance_map(patch_size: tuple, sigma_scale: float = 0.125) 
 # Helpers
 # =============================================================================
 
-def _mm_to_voxels(patch_size_mm, spacing, img_shape):
-    """Convert mm patch size to voxels, clamped to image size."""
+def _mm_to_voxels(patch_size_mm, spacing, img_shape,
+                  n_downsample=None, model_scale=None):
+    """Convert mm patch size to voxels.
+
+    If ``n_downsample`` and ``model_scale`` are provided, the result is
+    rounded *down* to a multiple of the per-axis cumulative pool factor, so
+    inference patches match the shapes the model saw at training time (and
+    avoid triggering the UNet's internal reflect-pad-to-divisible path).
+    Without those args, the result is just clamped to image size.
+    """
     if isinstance(patch_size_mm, (int, float)):
         patch_size_mm = (float(patch_size_mm),) * 3
     spacing_arr = np.array(spacing)
@@ -62,7 +70,19 @@ def _mm_to_voxels(patch_size_mm, spacing, img_shape):
         max(8, int(round(mm / sp)))
         for mm, sp in zip(patch_size_mm, spacing_arr)
     )
-    return tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
+    patch_voxels = tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
+
+    if n_downsample is not None and model_scale is not None:
+        from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
+        final_sp = compute_steps_through_pooling(tuple(spacing), n_downsample, model_scale)[-1]
+        pool_factors = tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
+        # Round down to multiple of pool_factor; never below pool_factor itself.
+        patch_voxels = tuple(
+            max(pf, (pv // pf) * pf)
+            for pv, pf in zip(patch_voxels, pool_factors)
+        )
+
+    return patch_voxels
 
 
 def _needs_projection(model):
@@ -142,6 +162,8 @@ def sliding_window_inference(
     sw_batch_size: int = 4,
     native_e3nn: bool = False,
     model_spacing: Optional[tuple] = None,
+    n_downsample: Optional[int] = None,
+    model_scale: Optional[float] = None,
 ) -> np.ndarray:
     """Batched sliding window inference with Gaussian weighting.
 
@@ -198,7 +220,10 @@ def sliding_window_inference(
     model = model.to(device).eval()
 
     img_shape = image.shape[1:]  # (D, H, W)
-    patch_voxels = _mm_to_voxels(patch_size_mm, spacing, img_shape)
+    patch_voxels = _mm_to_voxels(
+        patch_size_mm, spacing, img_shape,
+        n_downsample=n_downsample, model_scale=model_scale,
+    )
     pd, ph, pw = patch_voxels
     D, H, W = img_shape
 

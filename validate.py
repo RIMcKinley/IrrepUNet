@@ -47,7 +47,8 @@ from irrepunet.models.unet import E3nnUNet
 
 def run_inference(image, model, spacing, patch_mm, overlap,
                   device_str, mirror_axes, sw_batch_size,
-                  native_e3nn=False):
+                  native_e3nn=False,
+                  n_downsample=None, model_scale=None):
     """Run sliding_window_inference from irrepunet.inference on preprocessed data.
 
     Uses the same reflect-padding, Gaussian weighting, and batched patch
@@ -90,6 +91,8 @@ def run_inference(image, model, spacing, patch_mm, overlap,
         mirror_axes=mirror_axes,
         sw_batch_size=sw_batch_size,
         native_e3nn=native_e3nn,
+        n_downsample=n_downsample,
+        model_scale=model_scale,
     )
 
 
@@ -467,6 +470,7 @@ def run_validation(
     model_config = config.get('model', config)
     n_base_filters = model_config.get('n_base_filters', 2)
     n_downsample = model_config.get('n_downsample', 4)
+    model_scale = float(model_config.get('scale', 2.0))
     gpu_mem_mb = torch.cuda.get_device_properties(gpu).total_memory / 1024**2
     target_memory_mb = gpu_mem_mb * 0.9
 
@@ -603,7 +607,8 @@ def run_validation(
             probs = run_inference(
                 img, inference_model, spacing, patch_mm, overlap,
                 device_str, mirror_axes, case_sw_batch,
-                native_e3nn=native_e3nn)
+                native_e3nn=native_e3nn,
+                n_downsample=n_downsample, model_scale=model_scale)
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
                 raise
