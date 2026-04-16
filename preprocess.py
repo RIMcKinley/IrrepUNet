@@ -26,7 +26,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import nibabel as nib
 import numpy as np
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, zoom
 from tqdm import tqdm
 
 
@@ -1036,6 +1036,179 @@ def create_subsampled_dataset(
     print(f"  - Combined (slice + in-plane): {total_combined}")
 
 
+def create_upsampled_case(
+    case_name: str,
+    output_dir: Path,
+    min_inplane_floor: float,
+    step: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Create in-plane upsampled versions of a preprocessed case.
+
+    Generates finer in-plane resolutions by upsampling coarse cases with cubic
+    interpolation. This is the mirror of skip-downsampling: it creates synthetic
+    fine-resolution data to bridge the train/validation resolution gap.
+
+    Parameters
+    ----------
+    case_name : str
+        Case identifier (must already be preprocessed)
+    output_dir : Path
+        Directory containing preprocessed data
+    min_inplane_floor : float
+        Minimum allowed in-plane spacing (floor). Targets at or below this are skipped.
+    step : float
+        Step size in mm for generating target resolutions (default 0.5)
+
+    Returns
+    -------
+    list of dict
+        Properties for each upsampled version created
+    """
+    image = np.load(output_dir / f"{case_name}.npy")
+    label = np.load(output_dir / f"{case_name}_seg.npy")
+
+    with open(output_dir / f"{case_name}.pkl", 'rb') as f:
+        props = pickle.load(f)
+
+    spacing = props['spacing']
+    created = []
+
+    is_isotropic = max(spacing) / (min(spacing) + 1e-9) < 1.5
+    if is_isotropic:
+        inplane_axes = (1, 2)
+    else:
+        slice_axis = find_slice_axis(spacing)
+        inplane_axes = tuple(i for i in range(3) if i != slice_axis)
+
+    current_inplane = (spacing[inplane_axes[0]] + spacing[inplane_axes[1]]) / 2
+
+    k = 1
+    while True:
+        target = current_inplane - k * step
+        if target <= min_inplane_floor or target <= 0:
+            break
+
+        zoom_factor = current_inplane / target  # >1 = upsample
+
+        zoom_img = [1.0] * 4   # (C, D, H, W)
+        zoom_lbl = [1.0] * 3   # (D, H, W)
+        for ax in inplane_axes:
+            zoom_img[ax + 1] = zoom_factor
+            zoom_lbl[ax] = zoom_factor
+
+        up_image = zoom(image, zoom_img, order=3)
+        up_label = zoom(label, zoom_lbl, order=0)
+
+        new_spacing = list(spacing)
+        for ax in inplane_axes:
+            new_spacing[ax] = spacing[ax] / zoom_factor
+        new_spacing = tuple(new_spacing)
+
+        class_locations = compute_class_locations(up_label)
+
+        suffix = f"_upxy_{target:.2f}mm"
+        np.save(output_dir / f"{case_name}{suffix}.npy", up_image)
+        np.save(output_dir / f"{case_name}{suffix}_seg.npy", up_label)
+
+        up_props = {
+            'spacing': new_spacing,
+            'shape': up_image.shape[1:],
+            'original_shape': props.get('original_shape'),
+            'bbox': props.get('bbox'),
+            'class_locations': class_locations,
+            'is_subsampled': True,
+            'subsample_type': 'inplane_upsample',
+            'inplane_axes': inplane_axes,
+            'target_inplane_mm': target,
+            'zoom_factor': zoom_factor,
+            'parent': case_name,
+        }
+
+        with open(output_dir / f"{case_name}{suffix}.pkl", 'wb') as f:
+            pickle.dump(up_props, f)
+
+        created.append(up_props)
+        k += 1
+
+    return created
+
+
+def create_upsampled_dataset(
+    output_dir: Path,
+    num_workers: int = 4,
+    step: float = 0.5,
+) -> None:
+    """Create in-plane upsampled versions of all preprocessed cases.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory containing preprocessed irrepunet data
+    num_workers : int
+        Number of parallel workers
+    step : float
+        Step size in mm for target resolutions (default 0.5)
+    """
+    case_names = []
+    min_inplane = float('inf')
+
+    print("Scanning dataset to find in-plane spacing statistics...")
+    for pkl_file in output_dir.glob('*.pkl'):
+        case_name = pkl_file.stem
+        if '_skip' in case_name or '_up' in case_name:
+            continue
+        case_names.append(case_name)
+
+        with open(pkl_file, 'rb') as f:
+            props = pickle.load(f)
+        spacing = props['spacing']
+        sorted_spacing = sorted(spacing)
+        inplane = (sorted_spacing[0] + sorted_spacing[1]) / 2
+        if inplane < min_inplane:
+            min_inplane = inplane
+
+    case_names = sorted(case_names)
+    min_inplane_floor = 0.9 * min_inplane
+
+    print(f"Found {len(case_names)} original cases")
+    print(f"Minimum in-plane spacing in dataset: {min_inplane:.3f} mm")
+    print(f"Floor (0.9 x min): {min_inplane_floor:.3f} mm")
+    print(f"Step size: {step:.2f} mm")
+
+    total_created = 0
+
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(
+                    create_upsampled_case,
+                    case_name,
+                    output_dir,
+                    min_inplane_floor,
+                    step,
+                ): case_name
+                for case_name in case_names
+            }
+
+            for future in tqdm(as_completed(futures), total=len(case_names), desc="Upsampling"):
+                case_name = futures[future]
+                try:
+                    created = future.result()
+                    total_created += len(created)
+                except Exception as e:
+                    print(f"Error processing {case_name}: {e}")
+                    raise
+    else:
+        for case_name in tqdm(case_names, desc="Upsampling"):
+            created = create_upsampled_case(
+                case_name, output_dir, min_inplane_floor, step
+            )
+            total_created += len(created)
+
+    print(f"\nUpsampling complete!")
+    print(f"Created {total_created} upsampled versions from {len(case_names)} cases")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Preprocess data for e3nnUNet (matching nnUNet normalization)',
@@ -1100,6 +1273,23 @@ def main():
              'In-plane augmentation only applied when new_inplane <= slice * ratio.'
     )
 
+    # Upsample command
+    upsample_parser = subparsers.add_parser(
+        'upsample', help='Create in-plane upsampled versions of preprocessed data'
+    )
+    upsample_parser.add_argument(
+        '--preprocessed_dir', type=str, required=True,
+        help='Path to irrepunet preprocessed directory'
+    )
+    upsample_parser.add_argument(
+        '--num_workers', type=int, default=4,
+        help='Number of parallel workers'
+    )
+    upsample_parser.add_argument(
+        '--step', type=float, default=0.5,
+        help='Step size in mm for target in-plane resolutions (default: 0.5)'
+    )
+
     # For backwards compatibility, also support old-style arguments
     parser.add_argument('--nnunet_raw', type=str, help=argparse.SUPPRESS)
     parser.add_argument('--nnunet_preprocessed', type=str, help=argparse.SUPPRESS)
@@ -1136,6 +1326,12 @@ def main():
             max_inplane=args.max_inplane,
             inplane_tolerance=args.inplane_tolerance,
             inplane_ratio_limit=args.inplane_ratio_limit
+        )
+    elif args.command == 'upsample':
+        create_upsampled_dataset(
+            output_dir=Path(args.preprocessed_dir),
+            num_workers=args.num_workers,
+            step=args.step,
         )
     else:
         parser.print_help()

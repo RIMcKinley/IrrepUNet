@@ -56,6 +56,7 @@ def group_cases_by_spacing(
     max_inplane_spacing: float = 0.0,
     min_slice_thickness: float = 0.0,
     max_slice_thickness: float = 0.0,
+    inplane_tolerance: float = 0.1,
 ) -> Dict[tuple, List[str]]:
     """Group cases by their spacing using tiered tolerance rounding.
 
@@ -88,6 +89,7 @@ def group_cases_by_spacing(
     """
     groups: Dict[tuple, List[str]] = {}
 
+    dropped_anisotropic = 0
     for case_name, props in properties.items():
         spacing = tuple(props.get('spacing', (1.0, 1.0, 1.0)))
 
@@ -95,6 +97,16 @@ def group_cases_by_spacing(
         canonical_spacing = tuple(sorted(spacing))
         inplane_spacing = canonical_spacing[0]  # Finest = in-plane
         slice_thickness = canonical_spacing[2]  # Coarsest = slice thickness
+
+        # Drop cases whose in-plane axes (the two finest) are too anisotropic.
+        # Uses the same isotropy definition as the preprocessing step.
+        if inplane_tolerance > 0:
+            ip_mean = (canonical_spacing[0] + canonical_spacing[1]) / 2
+            if ip_mean > 0:
+                ip_rel_diff = abs(canonical_spacing[1] - canonical_spacing[0]) / ip_mean
+                if ip_rel_diff > inplane_tolerance:
+                    dropped_anisotropic += 1
+                    continue
 
         # Skip cases with spacing below min_spacing threshold
         if min_spacing > 0 and inplane_spacing < min_spacing:
@@ -112,14 +124,23 @@ def group_cases_by_spacing(
         if max_slice_thickness > 0 and slice_thickness > max_slice_thickness:
             continue
 
-        # Round using tiered tolerance for cleaner group keys
-        rounded_spacing = round_spacing_to_tolerance(canonical_spacing)
+        # Snap the in-plane pair to a shared value before grid-rounding so
+        # that float noise at grid midpoints (e.g. (2.75, 2.75, ...)) cannot
+        # split the pair across adjacent grid cells.
+        ip_mean = (canonical_spacing[0] + canonical_spacing[1]) / 2
+        ip_rounded = round_to_grid(ip_mean)
+        sl_rounded = round_to_grid(canonical_spacing[2])
+        rounded_spacing = (ip_rounded, ip_rounded, sl_rounded)
 
         # Find matching group (using rounded spacing as key)
         if rounded_spacing in groups:
             groups[rounded_spacing].append(case_name)
         else:
             groups[rounded_spacing] = [case_name]
+
+    if dropped_anisotropic > 0:
+        print(f"  Dropped {dropped_anisotropic} cases with in-plane anisotropy > "
+              f"{inplane_tolerance:.0%}")
 
     return groups
 
@@ -165,30 +186,3 @@ def apply_axis_permutation(arr: np.ndarray, perm: tuple, has_channel: bool = Tru
     return np.transpose(arr, full_perm)
 
 
-def resolve_root_parent(case_id: str, properties: Dict[str, dict]) -> str:
-    """Walk the parent chain in metadata to find the original (non-subsampled) case.
-
-    Parent chains can be 2+ deep (e.g., case_0001_skip0_10x_skipxy_3x
-    -> case_0001_skip0_10x -> case_0001).
-
-    Parameters
-    ----------
-    case_id : str
-        The subsampled case identifier
-    properties : dict
-        Mapping from case_id to metadata dict (must contain 'parent' for subsampled cases)
-
-    Returns
-    -------
-    str
-        The root parent case identifier (the original, non-subsampled case)
-    """
-    current = case_id
-    visited = {current}
-    while current in properties and properties[current].get('is_subsampled', False):
-        parent = properties[current].get('parent')
-        if parent is None or parent in visited:
-            break
-        visited.add(parent)
-        current = parent
-    return current

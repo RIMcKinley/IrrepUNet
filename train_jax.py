@@ -496,8 +496,6 @@ def train(args, config_hash=None, planned_batch_sizes=None,
         min_slice_thickness=getattr(args, 'min_slice_thickness', 0.0),
         max_slice_thickness=getattr(args, 'max_slice_thickness', 0.0),
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
-        superres_training=getattr(args, 'superres_training', False),
-        superres_weight=getattr(args, 'superres_weight', 0.1),
         group_balance=getattr(args, 'group_balance', 0.0),
         planned_batch_sizes=planned_batch_sizes,
     )
@@ -1357,10 +1355,6 @@ def main():
                              help='Weight for subsampled data (default: 0.0)')
     train_group.add_argument('--group_balance', type=float, default=0.0,
                              help='Balance sampling across resolution groups (default: 0.0)')
-    train_group.add_argument('--superres_training', action='store_true',
-                             help='Enable super-resolution training')
-    train_group.add_argument('--superres_weight', type=float, default=0.1,
-                             help='Sampling weight for super-resolution batches (default: 0.1)')
     train_group.add_argument('--min_spacing', type=float, default=0.0,
                              help='Exclude cases with finest spacing below this value')
     train_group.add_argument('--max_inplane_spacing', type=float, default=0.0,

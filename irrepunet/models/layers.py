@@ -2013,34 +2013,3 @@ class Decoder(nn.Module):
             # Return list: [coarsest, ..., finest (main output to be added by caller)]
             return x, ds_outputs
         return x
-
-    def forward_superres(self, x, encoder_features):
-        """Forward pass for super-resolution: interpolate skip connections when
-        spatial dimensions don't match between encoder features and decoder.
-
-        No deep supervision for super-res batches (simplifies implementation).
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Bottleneck features from encoder
-        encoder_features : list of torch.Tensor
-            Encoder features at each level (from finest to coarsest)
-
-        Returns
-        -------
-        torch.Tensor
-            Decoded features at full resolution
-        """
-        for i in range(self.n_blocks):
-            x = self.upsample_ops[i](x)
-            skip = encoder_features[::-1][i + 1]
-            # Interpolate skip if spatial dims don't match decoder
-            if skip.shape[2:] != x.shape[2:]:
-                skip = F.interpolate(
-                    skip, size=x.shape[2:],
-                    mode='trilinear', align_corners=True
-                )
-            x = torch.cat([x, skip], dim=1)
-            x = self.up_blocks[i](x)
-        return x

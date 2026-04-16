@@ -22,6 +22,7 @@ from .multi_resolution_loader import (
     mm_to_voxels, compute_steps_through_pooling, verify_receptive_field,
     adjust_for_divisibility_per_dim, discover_skip_files,
 )
+from .decimation import decimate_array, random_offsets, compute_class_locations
 
 
 # =============================================================================
@@ -77,14 +78,29 @@ def _load_and_extract_patch(
 ):
     """Load a case, apply axis permutation, and extract a random patch.
 
+    Synthetic decimated cases load the base source's .npy and apply ``np.take``.
+
     Returns (data_patch, seg_patch, canonical_spacing).
     """
-    data = np.load(preprocessed_dir / f"{case_id}.npy")
-    seg = np.load(preprocessed_dir / f"{case_id}_seg.npy")[np.newaxis]
-
     props = properties.get(case_id, {})
+    strides = props.get('decimation_strides')
+    if strides and any(s > 1 for s in strides):
+        base_id = props['decimation_base_id']
+        data = np.load(preprocessed_dir / f"{base_id}.npy")
+        seg_raw = np.load(preprocessed_dir / f"{base_id}_seg.npy")
+        offsets = random_offsets(strides)
+        data = decimate_array(data, strides, has_channel=True, offsets=offsets)
+        seg_raw = decimate_array(seg_raw, strides, has_channel=False, offsets=offsets)
+        # Per-sample random offset: class_locations depend on the offset and
+        # are recomputed from the decimated seg (small arrays → cheap).
+        class_locations = compute_class_locations(seg_raw)
+        seg = seg_raw[np.newaxis]
+    else:
+        data = np.load(preprocessed_dir / f"{case_id}.npy")
+        seg = np.load(preprocessed_dir / f"{case_id}_seg.npy")[np.newaxis]
+        class_locations = props.get('class_locations', {})
+
     original_spacing = props.get('spacing', (1.0, 1.0, 1.0))
-    class_locations = props.get('class_locations', {})
 
     perm = get_canonical_permutation(original_spacing)
     if perm != (0, 1, 2):
@@ -380,8 +396,6 @@ class MultiResolutionLoader:
         min_slice_thickness: float = 0.0,
         max_slice_thickness: float = 0.0,
         min_loader_cases: int = 2,
-        superres_training: bool = False,
-        superres_weight: float = 0.1,
         group_balance: float = 0.0,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
         planned_val_batch_sizes: Optional[Dict[tuple, int]] = None,
@@ -389,6 +403,9 @@ class MultiResolutionLoader:
         rank: int = 0,
         world_size: int = 1,
         sync_groups: bool = False,
+        decimation_max_thickness: float = 0.0,
+        decimation_max_inplane: float = 4.0,
+        decimation_inplane_ratio_limit: float = 1.1,
     ):
         self.preprocessed_dir = Path(preprocessed_dir)
         self._rank = rank
@@ -417,25 +434,18 @@ class MultiResolutionLoader:
         # of the global ``patch_size_mm`` for that spacing's mm_to_voxels call.
         self.planned_patch_sizes_mm = planned_patch_sizes_mm or {}
 
-        # --- Load all .pkl metadata once ---
-        properties = {}
-        for case_name in case_identifiers:
-            pkl_path = self.preprocessed_dir / f"{case_name}.pkl"
-            if pkl_path.exists():
-                with open(pkl_path, 'rb') as f:
-                    properties[case_name] = pickle.load(f)
-
-        # --- Discover subsampled cases ---
-        subsampled_cases_list = []
-        if subsample_weight > 0:
-            for case_name in case_identifiers:
-                for pkl_path in self.preprocessed_dir.glob(f"{case_name}_skip*.pkl"):
-                    sub_case_name = pkl_path.stem
-                    with open(pkl_path, 'rb') as f:
-                        sub_props = pickle.load(f)
-                    if sub_props.get('is_subsampled', False):
-                        properties[sub_case_name] = sub_props
-                        subsampled_cases_list.append(sub_case_name)
+        # --- Load metadata + enumerate synthetic decimation variants ---
+        # Upxy stays on disk (cubic zoom is too slow to do per-batch); skip
+        # variants are enumerated synthetically and applied via np.take on
+        # load.  See discover_skip_files for the full policy.
+        properties, subsampled_cases_list = discover_skip_files(
+            self.preprocessed_dir,
+            case_identifiers,
+            subsample_weight,
+            decimation_max_thickness=decimation_max_thickness,
+            decimation_max_inplane=decimation_max_inplane,
+            decimation_inplane_ratio_limit=decimation_inplane_ratio_limit,
+        )
 
         self.subsampled_cases = set(subsampled_cases_list)
         self._all_properties = properties
@@ -502,11 +512,13 @@ class MultiResolutionLoader:
                     print(f"    Using planned batch size {planned_bs} for {spacing}")
             elif self.planned_batch_sizes:
                 # Spacing not in the planned dict (e.g. exceeded the planning
-                # memory budget, or new data added since planning).  Include
-                # it anyway with bs=1 — silent exclusion masks bugs and breaks
-                # validation coverage.  If bs=1 OOMs, the user sees it directly.
-                group_batch_size = 1
-                print(f"    Using batch size 1 for unplanned spacing {spacing}")
+                # memory budget).  Drop it rather than falling back to bs=1 +
+                # full mm patch — the planner already decided it doesn't fit,
+                # and running it at full patch would OOM on sample.
+                skipped_groups.append(
+                    (spacing, f"not in plan ({len(cases)} cases dropped)")
+                )
+                continue
 
             n_orig = sum(1 for c in cases if c not in self.subsampled_cases)
             n_sub = sum(1 for c in cases if c in self.subsampled_cases)
@@ -592,9 +604,6 @@ class MultiResolutionLoader:
             print(f"    Fix: choose a patch_size_mm that's a multiple of the "
                   f"bottleneck spacing for the affected groups, or accept the "
                   f"reduction as intended.")
-
-        # Super-resolution loaders (deferred to later PR)
-        self.superres_loaders: Dict = {}
 
         # Expected patches per step (weighted average batch size across groups).
         # Used by DDP to convert patches_per_epoch → step count so all ranks
@@ -781,7 +790,6 @@ class MultiResolutionLoader:
         else:
             selected_spacing = group_spacing
 
-        # Store canonical group spacing for spatial_splits lookup
         batch['group_spacing'] = group_spacing
 
         return batch, selected_spacing
@@ -804,8 +812,6 @@ class MultiResolutionLoader:
 
         loader_groups = []
         for spacing, weight in self.group_weights:
-            if isinstance(spacing, tuple) and len(spacing) == 3 and spacing[0] == 'superres':
-                continue
             patch_voxels = self.group_patch_sizes.get(spacing, ())
             batch_size = self.group_batch_sizes.get(spacing, self.batch_size)
             est_mem = estimate_memory_mb(
@@ -823,33 +829,10 @@ class MultiResolutionLoader:
             else:
                 group_type = 'real'
 
-            n_spatial_splits = 1
-            if batch_size == 1 and self.target_memory_mb > 0:
-                mem_for_1 = estimate_memory_mb(
-                    patch_voxels, self.n_base_filters,
-                    batch_size=1, n_downsample=self.n_downsample,
-                    fp16=self.fp16, spacing=spacing,
-                )
-                if mem_for_1 > self.target_memory_mb:
-                    test_patch = list(patch_voxels)
-                    while mem_for_1 > self.target_memory_mb and n_spatial_splits <= 16:
-                        n_spatial_splits *= 2
-                        max_dim_idx = test_patch.index(max(test_patch))
-                        test_patch[max_dim_idx] = max(
-                            self.pooling_factor, test_patch[max_dim_idx] // 2
-                        )
-                        mem_for_1 = estimate_memory_mb(
-                            tuple(test_patch), self.n_base_filters,
-                            batch_size=1, n_downsample=self.n_downsample,
-                            fp16=self.fp16, spacing=spacing,
-                        )
-                    est_mem = mem_for_1
-
             loader_groups.append({
                 'spacing': spacing,
                 'patch_size_voxels': patch_voxels,
                 'batch_size': batch_size,
-                'n_spatial_splits': n_spatial_splits,
                 'estimated_memory_mb': round(est_mem, 1),
                 'n_cases': len(cases),
                 'group_type': group_type,
