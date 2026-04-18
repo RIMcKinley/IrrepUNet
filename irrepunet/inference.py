@@ -58,10 +58,17 @@ def _mm_to_voxels(patch_size_mm, spacing, img_shape,
     """Convert mm patch size to voxels.
 
     If ``n_downsample`` and ``model_scale`` are provided, the result is
-    rounded *down* to a multiple of the per-axis cumulative pool factor, so
-    inference patches match the shapes the model saw at training time (and
-    avoid triggering the UNet's internal reflect-pad-to-divisible path).
-    Without those args, the result is just clamped to image size.
+    rounded to the *nearest* multiple of the per-axis cumulative pool
+    factor — preferring the larger multiple when the raw count falls near
+    a midpoint.  After rounding, the result is clamped to the image size;
+    any remaining non-alignment is handled by the UNet's internal
+    reflect-pad-to-divisible path (which is correct, just slightly
+    wasteful on padding voxels).
+
+    Previous behaviour (floor) could lose up to one pool-factor of
+    coverage per axis (e.g. 170 voxels → 128 at pool factor 64, a 25%
+    reduction), causing many more sliding-window patches and reducing
+    per-patch context.
     """
     if isinstance(patch_size_mm, (int, float)):
         patch_size_mm = (float(patch_size_mm),) * 3
@@ -70,17 +77,22 @@ def _mm_to_voxels(patch_size_mm, spacing, img_shape,
         max(8, int(round(mm / sp)))
         for mm, sp in zip(patch_size_mm, spacing_arr)
     )
-    patch_voxels = tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
 
     if n_downsample is not None and model_scale is not None:
         from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
         final_sp = compute_steps_through_pooling(tuple(spacing), n_downsample, model_scale)[-1]
         pool_factors = tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
-        # Round down to multiple of pool_factor; never below pool_factor itself.
+        # Round to nearest multiple of pool_factor, then clamp to image.
+        # The model's internal padding handles any residual non-alignment
+        # after the image clamp.
         patch_voxels = tuple(
-            max(pf, (pv // pf) * pf)
+            max(pf, ((pv + pf // 2) // pf) * pf)
             for pv, pf in zip(patch_voxels, pool_factors)
         )
+
+    # Clamp to image size (after pool alignment so we round up when
+    # possible, only shrinking when the image is genuinely smaller).
+    patch_voxels = tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
 
     return patch_voxels
 
@@ -106,7 +118,7 @@ def _compute_padding(dim, patch, step):
     return patch + n_steps * step - dim
 
 
-def _patch_starts(dim, patch, max_step):
+def _patch_starts(dim, patch, max_step, min_patches=2):
     """Compute patch start positions covering ``[0, dim)`` with overlap as a
     minimum constraint (``max_step = patch * (1 - min_overlap)``).
 
@@ -115,6 +127,11 @@ def _patch_starts(dim, patch, max_step):
     max_step``; the volume needs **no** padding.  When ``dim <= patch`` a
     single patch is used and the volume must be reflect-padded by
     ``patch - dim`` to fill the patch.
+
+    ``min_patches`` ensures at least that many positions per axis (default
+    2), so every voxel is predicted from multiple overlapping patches.
+    When the image is only slightly larger than the patch, this prevents
+    degenerate single-patch coverage.
 
     The starts are constructed by rounding the first half of the positions
     and mirroring them to the second half, so the set of positions is
@@ -130,9 +147,19 @@ def _patch_starts(dim, patch, max_step):
         Padding to add so the patches fit (only nonzero when ``dim <= patch``).
     """
     if dim <= patch:
-        return [0], patch - dim
+        total_pad = patch - dim
+        if min_patches >= 2 and total_pad > 0:
+            # Multiple offset views: shift the image within the patch so
+            # zero-padding fills different regions, giving the model
+            # varied boundary context to average over.
+            # Pad by total_pad on EACH side so all offsets fit.
+            offsets = [round(i * total_pad / (min_patches - 1))
+                       for i in range(min_patches)]
+            starts = [total_pad - o for o in offsets]
+            return starts, 2 * total_pad
+        return [0], total_pad
     n_steps = (dim - patch + max_step - 1) // max_step  # ceil
-    n = n_steps + 1
+    n = max(n_steps + 1, min_patches)
     if n <= 1:
         return [0], 0
     travel = dim - patch
@@ -164,6 +191,7 @@ def sliding_window_inference(
     model_spacing: Optional[tuple] = None,
     n_downsample: Optional[int] = None,
     model_scale: Optional[float] = None,
+    min_patches: int = 8,
 ) -> np.ndarray:
     """Batched sliding window inference with Gaussian weighting.
 
@@ -228,15 +256,32 @@ def sliding_window_inference(
     D, H, W = img_shape
 
     # Patch positions: overlap is treated as a *minimum*; patches are
-    # distributed evenly within each dimension so no reflect-padding is
-    # needed when the volume is at least the patch size.
+    # distributed evenly within each dimension so no padding is needed
+    # when the volume is at least the patch size.
     max_step_d = max(1, int(pd * (1 - overlap)))
     max_step_h = max(1, int(ph * (1 - overlap)))
     max_step_w = max(1, int(pw * (1 - overlap)))
 
-    d_positions, total_pad_d = _patch_starts(D, pd, max_step_d)
-    h_positions, total_pad_h = _patch_starts(H, ph, max_step_h)
-    w_positions, total_pad_w = _patch_starts(W, pw, max_step_w)
+    # Distribute min_patches across axes: start with overlap-derived
+    # counts, then bump the axis with fewest positions until the product
+    # reaches min_patches.
+    dims = [(D, pd, max_step_d), (H, ph, max_step_h), (W, pw, max_step_w)]
+    per_axis_min = [1, 1, 1]
+    for i, (dim, patch, step) in enumerate(dims):
+        if dim <= patch:
+            per_axis_min[i] = 1
+        else:
+            n_steps = (dim - patch + step - 1) // step
+            per_axis_min[i] = n_steps + 1
+
+    while per_axis_min[0] * per_axis_min[1] * per_axis_min[2] < min_patches:
+        # Bump the axis with fewest positions (ties broken by index)
+        bump = min(range(3), key=lambda i: per_axis_min[i])
+        per_axis_min[bump] += 1
+
+    d_positions, total_pad_d = _patch_starts(D, pd, max_step_d, min_patches=per_axis_min[0])
+    h_positions, total_pad_h = _patch_starts(H, ph, max_step_h, min_patches=per_axis_min[1])
+    w_positions, total_pad_w = _patch_starts(W, pw, max_step_w, min_patches=per_axis_min[2])
 
     # Pad only the dimensions where the volume is smaller than the patch.
     pad_d0, pad_d1 = total_pad_d // 2, total_pad_d - total_pad_d // 2
@@ -248,7 +293,7 @@ def sliding_window_inference(
         image_tensor = F.pad(
             image_tensor.unsqueeze(0),
             (pad_w0, pad_w1, pad_h0, pad_h1, pad_d0, pad_d1),
-            mode='reflect',
+            mode='constant', value=0,
         ).squeeze(0)
 
     # Patch positions returned by _patch_starts are relative to the original

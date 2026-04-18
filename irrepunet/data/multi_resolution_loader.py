@@ -244,6 +244,11 @@ def compute_steps_through_pooling(spacing, n_downsample, model_scale=2.0):
 def adjust_for_divisibility_per_dim(voxels, factors, min_size=8):
     """Adjust voxels to be divisible by per-dimension pooling factors.
 
+    Rounds to the *nearest* multiple of the pool factor (preferring the
+    larger multiple at midpoints) rather than always flooring.  Flooring
+    can lose up to one pool-factor of coverage per axis (e.g. 170 → 128
+    at factor 64, a 25% reduction in effective patch size).
+
     Parameters
     ----------
     voxels : tuple
@@ -263,7 +268,7 @@ def adjust_for_divisibility_per_dim(voxels, factors, min_size=8):
         if f > 1:
             v_int = int(v)
             f_int = int(f)
-            v_adj = max(f_int, (v_int // f_int) * f_int)
+            v_adj = max(f_int, ((v_int + f_int // 2) // f_int) * f_int)
         else:
             v_adj = max(min_size, int(round(v)))
         adjusted.append(v_adj)

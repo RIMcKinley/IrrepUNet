@@ -3548,7 +3548,7 @@ def main():
                             help='Std dev of multiplicative Gaussian jitter applied to pooling scales '
                                  '(default: 0.0, disabled). Smooths architecture boundaries. '
                                  'Recommended: 0.05 (5%% jitter).')
-    train_group.add_argument('--num_workers', type=int, default=1,
+    train_group.add_argument('--num_workers', type=int, default=4,
                             help='Number of dataloader workers per resolution group (default: 1)')
     train_group.add_argument('--resume', action='store_true',
                             help='Resume from checkpoint')
