@@ -14,40 +14,50 @@ import numpy as np
 SPACING_GRID = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0)
 
 
-def round_to_grid(value: float, grid: tuple = SPACING_GRID) -> float:
+def set_spacing_grid(grid):
+    """Override the module-level ``SPACING_GRID`` at runtime.
+
+    Call this before any planning / grouping / rounding work so that
+    ``round_to_grid`` and ``round_spacing_to_tolerance`` pick up the new grid
+    (both read ``SPACING_GRID`` lazily when their ``grid`` argument is None).
+    Direct ``from ... import SPACING_GRID`` bindings in other modules still
+    reference the old tuple; prefer attribute access (``spacing.SPACING_GRID``)
+    or pass ``grid=`` explicitly at call sites that need the new value.
+    """
+    global SPACING_GRID
+    SPACING_GRID = tuple(sorted(float(v) for v in grid))
+    return SPACING_GRID
+
+
+def round_to_grid(value: float, grid: tuple = None) -> float:
     """Round a value to the nearest value in the grid.
 
     Parameters
     ----------
     value : float
         Value to round
-    grid : tuple
-        Allowed values to round to
-
-    Returns
-    -------
-    float
-        Nearest grid value
+    grid : tuple, optional
+        Allowed values to round to.  When ``None`` (default), the
+        module-level ``SPACING_GRID`` is used — read at call time so that
+        ``set_spacing_grid`` takes effect without rebinding callers.
     """
+    if grid is None:
+        grid = SPACING_GRID
     return min(grid, key=lambda x: abs(x - value))
 
 
-def round_spacing_to_tolerance(spacing: tuple) -> tuple:
+def round_spacing_to_tolerance(spacing: tuple, grid: tuple = None) -> tuple:
     """Round spacing values to the nearest values in the spacing grid.
-
-    Grid values: 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0 mm
 
     Parameters
     ----------
     spacing : tuple
         Spacing values (D, H, W)
-
-    Returns
-    -------
-    tuple
-        Rounded spacing values
+    grid : tuple, optional
+        Grid to round against.  When ``None`` (default), the module-level
+        ``SPACING_GRID`` is used at call time.
     """
-    return tuple(round_to_grid(s) for s in spacing)
+    return tuple(round_to_grid(s, grid=grid) for s in spacing)
 
 
 def group_cases_by_spacing(

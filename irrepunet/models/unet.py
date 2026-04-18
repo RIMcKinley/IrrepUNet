@@ -349,7 +349,7 @@ class E3nnUNet(nn.Module):
 
         return pad
 
-    def forward(self, x, spacing=None, scales=None):
+    def forward(self, x, spacing=None, scales=None, spacing_scale=None):
         """Forward pass.
 
         Parameters
@@ -381,6 +381,13 @@ class E3nnUNet(nn.Module):
         # Rebuild network if spacing changed or custom scales provided
         if spacing != self._current_spacing or scales is not None:
             self._rebuild_for_spacing(spacing, scales=scales)
+
+        # Propagate spacing_scale to all VoxelConvolution layers.
+        # This jitters kernel weights (SH/RBF) without changing kernel
+        # voxel size or pooling — a regularizer for spacing robustness.
+        for m in self.modules():
+            if hasattr(m, '_spacing_scale'):
+                m._spacing_scale = spacing_scale
 
         # Compute and apply padding
         pad = self._compute_padding(x.shape[-3:])

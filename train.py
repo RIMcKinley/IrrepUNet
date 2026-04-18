@@ -463,8 +463,13 @@ def _profile_single_step(
             outputs = model(x, spacing=spacing_t)
 
             if deep_supervision and isinstance(outputs, (list, tuple)):
-                # Build multi-scale targets
-                output_shapes = [o.shape[2:] for o in outputs]
+                # Build multi-scale targets; downsample_seg drops levels with
+                # any zero dim — filter outputs in the same way to keep the
+                # pred/target lists aligned for DeepSupervisionLoss.
+                valid = [(o, o.shape[2:]) for o in outputs
+                         if all(s > 0 for s in o.shape[2:])]
+                outputs = [o for o, _ in valid]
+                output_shapes = [s for _, s in valid]
                 multi_seg = downsample_seg_for_deep_supervision(seg, output_shapes)
                 loss = criterion(outputs, multi_seg)
             else:
@@ -1499,6 +1504,7 @@ class ExperimentPlanner:
                 "max_inplane_spacing": getattr(self.args, 'max_inplane_spacing', 0.0),
                 "min_slice_thickness": getattr(self.args, 'min_slice_thickness', 0.0),
                 "max_slice_thickness": getattr(self.args, 'max_slice_thickness', 0.0),
+                "spacing_grid": getattr(self.args, 'spacing_grid_values', None),
                 "min_loader_cases": getattr(self.args, 'min_loader_cases', 2),
                 "group_balance": getattr(self.args, 'group_balance', 0.0),
                 "bias_field": getattr(self.args, 'bias_field', True),
@@ -2791,11 +2797,24 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         images = batch['data'].to(device, dtype=input_dtype)
                         labels = batch['seg'].to(device).long().squeeze(1)
 
-                    # Apply resolution jitter if enabled
+                    # Apply resolution jitter if enabled.
+                    # With use_group_spacing, jitter only affects kernel
+                    # weights (SH/RBF), not kernel voxel size or pooling.
+                    spacing_scale = None
                     if args.resolution_jitter_sigma > 0:
                         jitter = np.random.normal(0, args.resolution_jitter_sigma, 3)
-                        jittered_spacing = tuple(s + j for s, j in zip(spacing, jitter))
-                        jittered_spacing = tuple(max(0.1, s) for s in jittered_spacing)
+                        if getattr(args, 'use_group_spacing', False):
+                            # Kernel-weight-only jitter: compute per-axis scale
+                            # factors that shift the lattice mm positions.
+                            spacing_scale = tuple(
+                                max(0.5, 1.0 + j / s)
+                                for s, j in zip(spacing, jitter)
+                            )
+                            jittered_spacing = spacing  # keep canonical
+                        else:
+                            jittered_spacing = tuple(
+                                max(0.1, s + j) for s, j in zip(spacing, jitter)
+                            )
                     else:
                         jittered_spacing = spacing
 
@@ -2818,7 +2837,8 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                     # Forward pass
                     with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                         if args.deep_supervision:
-                            outputs = model(images, spacing=jittered_spacing, scales=jittered_scales)
+                            outputs = model(images, spacing=jittered_spacing,
+                                            scales=jittered_scales, spacing_scale=spacing_scale)
                             # Filter out outputs with 0-size spatial dims
                             # (can happen with very deep networks on small patches)
                             valid_outputs = [o for o in outputs if all(s > 0 for s in o.shape[2:])]
@@ -2828,7 +2848,8 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                             )
                             loss = criterion(valid_outputs, multi_scale_labels)
                         else:
-                            outputs = model(images, spacing=jittered_spacing, scales=jittered_scales)
+                            outputs = model(images, spacing=jittered_spacing,
+                                            scales=jittered_scales, spacing_scale=spacing_scale)
                             loss = criterion(outputs, labels)
 
                     # Backward pass with loss scaled by accum steps
@@ -3354,6 +3375,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['max_inplane_spacing'] = aug.get('max_inplane_spacing', 0.0)
     args_dict['min_slice_thickness'] = aug.get('min_slice_thickness', 0.0)
     args_dict['max_slice_thickness'] = aug.get('max_slice_thickness', 0.0)
+    args_dict['spacing_grid_values'] = aug.get('spacing_grid', None)
     args_dict['min_loader_cases'] = aug.get('min_loader_cases', 2)
     args_dict['group_balance'] = aug.get('group_balance', 0.0)
     args_dict['bias_field'] = aug.get('bias_field', True)
@@ -3538,6 +3560,11 @@ def main():
                             help='Exclude cases with slice thickness below this value in mm (default: 0.0, include all)')
     train_group.add_argument('--max_slice_thickness', type=float, default=0.0,
                             help='Exclude cases with slice thickness above this value in mm (default: 0.0, include all)')
+    train_group.add_argument('--spacing_grid', type=str, default=None,
+                            help='Override irrepunet.data.spacing.SPACING_GRID with a comma-separated '
+                                 'list of mm values (e.g. "0.2,0.25,...,1.5,2.0,...,6.0"). '
+                                 'Applied before planning / grouping so loader groups track the new grid. '
+                                 'Persisted to config.json as augmentation.spacing_grid.')
     train_group.add_argument('--min_loader_cases', type=int, default=2,
                             help='Minimum cases per loader group (groups with fewer cases are skipped)')
     train_group.add_argument('--pooling_factor', type=int, default=8,
@@ -3606,6 +3633,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Parse and apply --spacing_grid override before any planning / grouping
+    # work consults ``irrepunet.data.spacing.SPACING_GRID``.
+    raw_grid = getattr(args, 'spacing_grid', None)
+    if raw_grid:
+        try:
+            grid_values = [float(x) for x in raw_grid.split(',') if x.strip()]
+        except ValueError as e:
+            print(f"Error parsing --spacing_grid: {e}", file=sys.stderr)
+            sys.exit(1)
+        from irrepunet.data import spacing as _spacing_mod
+        _spacing_mod.set_spacing_grid(grid_values)
+        args.spacing_grid_values = list(_spacing_mod.SPACING_GRID)
+        print(f"Overriding SPACING_GRID: {args.spacing_grid_values}")
+    else:
+        args.spacing_grid_values = None
+
     # Resolve sc_mode from --sequential_sc legacy flag
     if getattr(args, 'sc_mode', None) is None:
         if getattr(args, 'sequential_sc', False):
@@ -3663,6 +3706,11 @@ def main():
         cli_wandb_project = getattr(args, 'wandb_project', 'irrepunet')
         cli_wandb_name = getattr(args, 'wandb_name', None)
         args = args_from_config(config, config_path=config_path, cli_resume=cli_resume)
+        # Apply spacing_grid from config (if set) before downstream work runs.
+        if getattr(args, 'spacing_grid_values', None):
+            from irrepunet.data import spacing as _spacing_mod
+            _spacing_mod.set_spacing_grid(args.spacing_grid_values)
+            print(f"Applied SPACING_GRID from config: {list(_spacing_mod.SPACING_GRID)}")
         # CLI W&B flags override config (allow enabling W&B without editing config)
         if cli_wandb:
             args.wandb = True

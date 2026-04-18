@@ -82,17 +82,13 @@ def _mm_to_voxels(patch_size_mm, spacing, img_shape,
         from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
         final_sp = compute_steps_through_pooling(tuple(spacing), n_downsample, model_scale)[-1]
         pool_factors = tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
-        # Round to nearest multiple of pool_factor, then clamp to image.
-        # The model's internal padding handles any residual non-alignment
-        # after the image clamp.
+        # Round to nearest multiple of pool_factor.  Do NOT clamp to
+        # image size here — _patch_starts handles dim < patch via
+        # padding, and that padding enables offset views for min_patches.
         patch_voxels = tuple(
             max(pf, ((pv + pf // 2) // pf) * pf)
             for pv, pf in zip(patch_voxels, pool_factors)
         )
-
-    # Clamp to image size (after pool alignment so we round up when
-    # possible, only shrinking when the image is genuinely smaller).
-    patch_voxels = tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
 
     return patch_voxels
 
@@ -104,6 +100,92 @@ def _needs_projection(model):
     except ImportError:
         return False
     return any(isinstance(m, VoxelConvolution) for m in model.modules())
+
+
+def _grid_neighbors(value, grid):
+    """Return the two grid values that bracket *value* (floor, ceil).
+
+    If *value* exactly matches a grid point, both are that point.
+    """
+    below = [g for g in grid if g <= value]
+    above = [g for g in grid if g >= value]
+    floor_val = max(below) if below else grid[0]
+    ceil_val = min(above) if above else grid[-1]
+    return floor_val, ceil_val
+
+
+def spacing_ensemble_members(spacing, tolerance=0.05, ambiguity_threshold=0.25):
+    """Return the set of spacings to ensemble for a given native spacing.
+
+    Per-axis classification:
+      - **off-canonical**: axis exceeds *tolerance* (relative) from its
+        nearest grid point.
+      - **ambiguous**: axis value sits near the midpoint between its two
+        bracketing grid points (``|frac - 0.5| <= ambiguity_threshold``,
+        with ``frac = (s - lo) / (hi - lo)``).
+
+    Ensemble only fires when every off-canonical axis is also ambiguous
+    — i.e. every axis that meaningfully disagrees with canonical is
+    genuinely in the "could go either way" zone.  If any axis is
+    clearly-closer-to-canonical but outside tolerance (e.g. 0.47 off 0.5,
+    6% rel — not ambiguous), we skip ensembling for that case because
+    averaging a biased neighbor into the prediction has been observed
+    empirically to hurt more than it helps.  Cases that *do* ensemble get
+    ``[native, canonical, alt]``, where ``alt`` flips each ambiguous axis
+    to the opposite grid neighbor.
+
+    Parameters
+    ----------
+    spacing : tuple
+        Native voxel spacing (3-tuple, mm).
+    tolerance : float
+        Maximum relative distance to canonical before an axis counts as
+        off-canonical (default 0.05 = 5%).
+    ambiguity_threshold : float
+        Half-width of the ambiguous zone around the gap midpoint, as a
+        fraction of the floor/ceil gap (default 0.25 → ambiguous when
+        0.25 <= frac <= 0.75).
+    """
+    from .data.spacing import SPACING_GRID, round_spacing_to_tolerance
+
+    canonical = round_spacing_to_tolerance(spacing)
+
+    off_canonical_axes = [
+        i for i, (s, c) in enumerate(zip(spacing, canonical))
+        if abs(s - c) / max(c, 0.01) > tolerance
+    ]
+    ambiguous_axes = []
+    for i, s in enumerate(spacing):
+        lo, hi = _grid_neighbors(s, SPACING_GRID)
+        if hi <= lo:
+            continue
+        frac = (s - lo) / (hi - lo)
+        if 0.5 - ambiguity_threshold <= frac <= 0.5 + ambiguity_threshold:
+            ambiguous_axes.append(i)
+
+    # Ensemble only if every off-canonical axis is also ambiguous.  (Empty
+    # ambiguous_axes fails the condition, so no ambiguous axes → canonical
+    # only, regardless of how many are off-canonical.)
+    ensemble_ok = bool(ambiguous_axes) and all(
+        a in ambiguous_axes for a in off_canonical_axes
+    )
+    if not ensemble_ok:
+        return [canonical]
+
+    alt = list(canonical)
+    for i in ambiguous_axes:
+        lo, hi = _grid_neighbors(spacing[i], SPACING_GRID)
+        alt[i] = hi if canonical[i] == lo else lo
+    alt = tuple(alt)
+
+    members = [spacing, canonical]
+    is_dup = any(
+        all(abs(a - b) / max(a, b, 0.01) < 0.01 for a, b in zip(alt, existing))
+        for existing in members
+    )
+    if not is_dup:
+        members.append(alt)
+    return members
 
 
 def _compute_padding(dim, patch, step):
