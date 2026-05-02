@@ -445,11 +445,13 @@ class MultiResolutionLoader:
         min_slice_thickness: float = 0.0,
         max_slice_thickness: float = 0.0,
         min_loader_cases: int = 2,
-        group_balance: float = 0.0,
+        sampling_temperature: float = 1.0,
+        mixed_group_real_floor: float = 0.25,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
         decimation_max_thickness: float = 0.0,
         decimation_max_inplane: float = 4.0,
         decimation_inplane_ratio_limit: float = 1.1,
+        dual_assign_ambiguous: bool = False,
     ):
         self.preprocessed_dir = Path(preprocessed_dir)
         self.batch_size = batch_size
@@ -465,6 +467,7 @@ class MultiResolutionLoader:
         self.fp16 = fp16
         self.subsample_weight = subsample_weight
         self.model_scale = model_scale
+        self.mixed_group_real_floor = mixed_group_real_floor
         self.planned_batch_sizes = planned_batch_sizes or {}
 
         # On-the-fly decimation: skip-subsampled variants are enumerated in
@@ -486,7 +489,8 @@ class MultiResolutionLoader:
         self.max_slice_thickness = max_slice_thickness
         self.spacing_groups = group_cases_by_spacing(
             properties, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-            min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+            min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+            dual_assign_ambiguous=dual_assign_ambiguous)
 
         # Track which cases are subsampled (for weight calculation)
         self.subsampled_cases = set(subsampled_cases)
@@ -549,15 +553,18 @@ class MultiResolutionLoader:
         total_weight = sum(w for _, w in self.group_weights)
         self.group_weights = [(s, w / total_weight) for s, w in self.group_weights]
 
-        # Apply group balancing: blend proportional with uniform
-        # balance=0: proportional to case count, balance=1: uniform across groups
-        if group_balance > 0 and len(self.group_weights) > 1:
-            uniform = 1.0 / len(self.group_weights)
-            self.group_weights = [
-                (s, (1 - group_balance) * w + group_balance * uniform)
-                for s, w in self.group_weights
-            ]
-            print(f"  Group balancing: {group_balance:.2f} (0=proportional, 1=uniform)")
+        # Apply sampling temperature: w <- w^t, renormalize.
+        # t=1 is proportional (no-op), t<1 flattens toward uniform, t=0 is exactly uniform.
+        if sampling_temperature != 1.0 and len(self.group_weights) > 1:
+            t = max(sampling_temperature, 0.0)
+            tempered = [w ** t for _, w in self.group_weights]
+            total = sum(tempered)
+            if total > 0:
+                self.group_weights = [
+                    (s, r / total) for (s, _), r in zip(self.group_weights, tempered)
+                ]
+            print(f"  Sampling temperature: {sampling_temperature:.2f} "
+                  f"(1.0=proportional, 0.0=uniform)")
 
         # Initialize iterators
         for spacing, loader in self.group_loaders.items():
@@ -637,6 +644,26 @@ class MultiResolutionLoader:
             oversample_foreground_percent=oversample_foreground_percent,
             probabilistic_oversampling=True,
         )
+
+        # Per-case sampling probabilities inside mixed groups.
+        # Default batchgenerators behaviour is uniform across cases, so a
+        # mixed group with lots of subsampled variants will sample
+        # subsampled cases at their raw proportion — which can bury the
+        # originals.  Enforce a floor on the real-cohort share within
+        # mixed groups only; pure-orig and pure-sub groups stay uniform.
+        floor = self.mixed_group_real_floor
+        if floor > 0 and cases:
+            orig_mask = np.array([c not in self.subsampled_cases for c in dataloader.indices])
+            n_orig = int(orig_mask.sum())
+            n_sub = len(orig_mask) - n_orig
+            if n_orig > 0 and n_sub > 0:
+                natural_real_share = n_orig / (n_orig + n_sub)
+                real_share = max(floor, natural_real_share)
+                if real_share > natural_real_share + 1e-12:
+                    probs = np.where(orig_mask,
+                                     real_share / n_orig,
+                                     (1 - real_share) / n_sub)
+                    dataloader.sampling_probabilities = probs
 
         if num_workers > 0 and transforms is not None:
             augmenter = MultiThreadedAugmenter(

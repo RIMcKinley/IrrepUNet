@@ -40,8 +40,16 @@ def _permute_class_locations(class_locations, perm):
     return permuted
 
 
-def _get_bbox(shape, patch_size, force_fg, class_locations):
-    """Compute patch bounding box with optional foreground centering."""
+def _get_bbox(shape, patch_size, force_fg, class_locations, rejection_fg=False):
+    """Compute patch bounding box with optional foreground sampling.
+
+    When ``force_fg`` is set:
+      - Default: pick a random foreground voxel and centre the patch on it.
+      - If ``rejection_fg`` is also set: pick a uniformly-random patch
+        position, reject if no foreground voxel falls inside, retry up to
+        50 times (matches Diaz CAIM ``check_labels=True`` rejection
+        sampling).  Falls back to centred sampling if all 50 attempts fail.
+    """
     dim = len(shape)
     lbs = [0] * dim
     ubs = [max(0, shape[i] - patch_size[i]) for i in range(dim)]
@@ -49,6 +57,24 @@ def _get_bbox(shape, patch_size, force_fg, class_locations):
     if force_fg and class_locations:
         eligible = [k for k in class_locations if len(class_locations[k]) > 0]
         if eligible:
+            if rejection_fg:
+                # Stack fg voxel coords into (N, dim) array (drop class col if present)
+                fg = np.concatenate([np.asarray(class_locations[k])
+                                     for k in eligible], axis=0)
+                if fg.shape[1] > dim:
+                    fg = fg[:, :dim]
+                ps = np.asarray(patch_size)
+                for _ in range(50):
+                    pos = np.array([
+                        np.random.randint(lbs[i], ubs[i] + 1)
+                        if ubs[i] > lbs[i] else lbs[i]
+                        for i in range(dim)
+                    ])
+                    end = pos + ps
+                    inside = np.all((fg >= pos) & (fg < end), axis=1)
+                    if inside.any():
+                        return pos.tolist(), end.tolist()
+                # Fall through to centred sampling on failure
             cls = np.random.choice(eligible)
             voxels = class_locations[cls]
             voxel = voxels[np.random.choice(len(voxels))]
@@ -74,7 +100,7 @@ def _pad_to_size(arr, target_shape):
 
 def _load_and_extract_patch(
     case_id, preprocessed_dir, properties, patch_size, num_channels,
-    oversample_foreground_percent,
+    oversample_foreground_percent, rejection_fg=False,
 ):
     """Load a case, apply axis permutation, and extract a random patch.
 
@@ -111,7 +137,34 @@ def _load_and_extract_patch(
 
     force_fg = np.random.uniform() < oversample_foreground_percent
     shape = data.shape[1:]
-    bbox_lbs, bbox_ubs = _get_bbox(shape, patch_size, force_fg, class_locations)
+    if force_fg and rejection_fg and class_locations:
+        # Diaz-style: uniformly random patch position, reject if no
+        # foreground voxel inside (checked against the real seg, NOT the
+        # subsampled class_locations).
+        dim = len(shape)
+        lbs = [0] * dim
+        ubs = [max(0, shape[i] - patch_size[i]) for i in range(dim)]
+        ps = list(patch_size)
+        seg_bin = (seg[0] > 0)
+        bbox_lbs = bbox_ubs = None
+        for _ in range(50):
+            cand = [
+                np.random.randint(lbs[i], ubs[i] + 1)
+                if ubs[i] > lbs[i] else lbs[i]
+                for i in range(dim)
+            ]
+            sl = tuple(slice(cand[i], cand[i] + ps[i]) for i in range(dim))
+            if seg_bin[sl].any():
+                bbox_lbs = cand
+                bbox_ubs = [bbox_lbs[i] + ps[i] for i in range(dim)]
+                break
+        if bbox_lbs is None:
+            # Fall back to centred sampling on failure
+            bbox_lbs, bbox_ubs = _get_bbox(shape, patch_size, True,
+                                            class_locations, rejection_fg=False)
+    else:
+        bbox_lbs, bbox_ubs = _get_bbox(shape, patch_size, force_fg,
+                                        class_locations, rejection_fg=False)
 
     slices = tuple(slice(lb, ub) for lb, ub in zip(bbox_lbs, bbox_ubs))
     data_patch = data[(slice(None),) + slices]
@@ -143,6 +196,11 @@ class _GroupConfig:
     weight: float
     n_original: int
     n_subsampled: int
+    # Per-case sampling probabilities (aligned with case_ids). None means
+    # uniform sampling via the shuffled-buffer path.  Non-None triggers
+    # weighted-choice-with-replacement sampling; used to enforce a floor
+    # on the real-cohort share within mixed groups.
+    case_weights: Optional[np.ndarray] = None
 
 
 # =============================================================================
@@ -158,7 +216,7 @@ class _MultiResIterableDataset(IterableDataset):
 
     def __init__(self, groups, preprocessed_dir, properties, transforms,
                  oversample_foreground_percent, num_channels, rank=0,
-                 sync_groups=False):
+                 sync_groups=False, rejection_fg=False):
         super().__init__()
         self.groups = groups
         self.preprocessed_dir = Path(preprocessed_dir)
@@ -168,6 +226,7 @@ class _MultiResIterableDataset(IterableDataset):
         self.num_channels = num_channels
         self._rank = rank
         self._sync_groups = sync_groups
+        self.rejection_fg = bool(rejection_fg)
 
         total = sum(g.weight for g in groups)
         self._weights = np.array([g.weight / total for g in groups])
@@ -182,7 +241,8 @@ class _MultiResIterableDataset(IterableDataset):
         elif self._rank > 0:
             np.random.seed((42 + self._rank * 2654435761) % (2**32))
 
-        # Per-worker shuffled case buffers
+        # Per-worker shuffled case buffers (unused when a group has
+        # explicit case_weights — those groups sample with replacement).
         buffers = []
         for group in self.groups:
             ids = list(group.case_ids)
@@ -206,14 +266,26 @@ class _MultiResIterableDataset(IterableDataset):
             buf = buffers[gi]
             patch_size = np.array(group.patch_size_voxels)
 
-            # Draw case IDs from shuffled buffer
-            case_ids = []
-            for _ in range(group.batch_size):
-                if buf['pos'] >= len(buf['ids']):
-                    np.random.shuffle(buf['ids'])
-                    buf['pos'] = 0
-                case_ids.append(buf['ids'][buf['pos']])
-                buf['pos'] += 1
+            # Draw case IDs.  When the group defines explicit case_weights
+            # (mixed groups with a real-share floor active), sample with
+            # replacement using those weights.  Otherwise use the shuffled
+            # buffer (without-replacement cycle).
+            if group.case_weights is not None:
+                idx = np.random.choice(
+                    len(group.case_ids),
+                    size=group.batch_size,
+                    replace=True,
+                    p=group.case_weights,
+                )
+                case_ids = [group.case_ids[i] for i in idx]
+            else:
+                case_ids = []
+                for _ in range(group.batch_size):
+                    if buf['pos'] >= len(buf['ids']):
+                        np.random.shuffle(buf['ids'])
+                        buf['pos'] = 0
+                    case_ids.append(buf['ids'][buf['pos']])
+                    buf['pos'] += 1
 
             # Build batch arrays
             data_all = np.zeros(
@@ -231,6 +303,7 @@ class _MultiResIterableDataset(IterableDataset):
                     case_id, self.preprocessed_dir, self.properties,
                     patch_size, self.num_channels,
                     self.oversample_foreground_percent,
+                    rejection_fg=getattr(self, 'rejection_fg', False),
                 )
                 data_all[j] = dp
                 seg_all[j] = sp
@@ -261,13 +334,15 @@ class _GroupIterator:
     """
 
     def __init__(self, group, preprocessed_dir, properties, transforms,
-                 oversample_foreground_percent, num_channels, rank=0):
+                 oversample_foreground_percent, num_channels, rank=0,
+                 rejection_fg=False):
         self.group = group
         self.preprocessed_dir = Path(preprocessed_dir)
         self.properties = properties
         self.transforms = transforms
         self.oversample_foreground_percent = oversample_foreground_percent
         self.num_channels = num_channels
+        self.rejection_fg = bool(rejection_fg)
 
         self._ids = list(group.case_ids)
         # Use rank-dependent RNG so each DDP rank shuffles differently
@@ -305,6 +380,7 @@ class _GroupIterator:
                 case_id, self.preprocessed_dir, self.properties,
                 patch_size, self.num_channels,
                 self.oversample_foreground_percent,
+                rejection_fg=getattr(self, 'rejection_fg', False),
             )
             data_all[j] = dp
             seg_all[j] = sp
@@ -396,7 +472,8 @@ class MultiResolutionLoader:
         min_slice_thickness: float = 0.0,
         max_slice_thickness: float = 0.0,
         min_loader_cases: int = 2,
-        group_balance: float = 0.0,
+        sampling_temperature: float = 1.0,
+        mixed_group_real_floor: float = 0.25,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
         planned_val_batch_sizes: Optional[Dict[tuple, int]] = None,
         planned_patch_sizes_mm: Optional[Dict[tuple, tuple]] = None,
@@ -406,11 +483,14 @@ class MultiResolutionLoader:
         decimation_max_thickness: float = 0.0,
         decimation_max_inplane: float = 4.0,
         decimation_inplane_ratio_limit: float = 1.1,
+        dual_assign_ambiguous: bool = False,
+        rejection_fg: bool = False,
     ):
         self.preprocessed_dir = Path(preprocessed_dir)
         self._rank = rank
         self._world_size = world_size
         self._sync_groups = sync_groups
+        self.rejection_fg = bool(rejection_fg)
         self.batch_size = batch_size
         self.dynamic_batch_size = dynamic_batch_size
         self.target_memory_mb = target_memory_mb
@@ -456,6 +536,7 @@ class MultiResolutionLoader:
             max_inplane_spacing=max_inplane_spacing,
             min_slice_thickness=min_slice_thickness,
             max_slice_thickness=max_slice_thickness,
+            dual_assign_ambiguous=dual_assign_ambiguous,
         )
 
         n_original = len(case_identifiers)
@@ -536,6 +617,23 @@ class MultiResolutionLoader:
 
             weight = (original_weight + subsampled_weight_val) / group_batch_size
 
+            # Per-case sampling weights inside mixed groups: floor the
+            # real-cohort share at `mixed_group_real_floor`.  Pure-orig
+            # and pure-sub groups stay on the uniform shuffled-buffer path.
+            case_weights = None
+            if mixed_group_real_floor > 0 and n_orig > 0 and n_sub > 0:
+                natural = n_orig / (n_orig + n_sub)
+                real_share = max(mixed_group_real_floor, natural)
+                if real_share > natural + 1e-12:
+                    orig_mask = np.array(
+                        [c not in self.subsampled_cases for c in cases]
+                    )
+                    case_weights = np.where(
+                        orig_mask,
+                        real_share / n_orig,
+                        (1 - real_share) / n_sub,
+                    )
+
             gc = _GroupConfig(
                 spacing=spacing,
                 case_ids=cases,
@@ -544,6 +642,7 @@ class MultiResolutionLoader:
                 weight=weight,
                 n_original=n_orig,
                 n_subsampled=n_sub,
+                case_weights=case_weights,
             )
             groups.append(gc)
 
@@ -623,14 +722,17 @@ class MultiResolutionLoader:
                 (s, w / total_weight) for s, w in self.group_weights
             ]
 
-        # Group balancing: blend proportional with uniform
-        if group_balance > 0 and len(self.group_weights) > 1:
-            uniform = 1.0 / len(self.group_weights)
-            self.group_weights = [
-                (s, (1 - group_balance) * w + group_balance * uniform)
-                for s, w in self.group_weights
-            ]
-            print(f"  Group balancing: {group_balance:.2f} (0=proportional, 1=uniform)")
+        # Sampling temperature: w <- w^t, renormalise (t=1 is no-op).
+        if sampling_temperature != 1.0 and len(self.group_weights) > 1:
+            t = max(sampling_temperature, 0.0)
+            tempered = [w ** t for _, w in self.group_weights]
+            total = sum(tempered)
+            if total > 0:
+                self.group_weights = [
+                    (s, r / total) for (s, _), r in zip(self.group_weights, tempered)
+                ]
+            print(f"  Sampling temperature: {sampling_temperature:.2f} "
+                  f"(1.0=proportional, 0.0=uniform)")
 
         # Update group configs with normalized weights
         weight_map = dict(self.group_weights)
@@ -649,6 +751,7 @@ class MultiResolutionLoader:
             self.group_loaders[gc.spacing] = _GroupIterator(
                 gc, self.preprocessed_dir, properties, transforms,
                 oversample_foreground_percent, num_channels, rank=rank,
+                rejection_fg=self.rejection_fg,
             )
 
         # Store groups + constructor args for curriculum filtering / DataLoader rebuild
@@ -664,7 +767,7 @@ class MultiResolutionLoader:
             dataset = _MultiResIterableDataset(
                 groups, self.preprocessed_dir, properties, transforms,
                 oversample_foreground_percent, num_channels, rank=rank,
-                sync_groups=sync_groups,
+                sync_groups=sync_groups, rejection_fg=self.rejection_fg,
             )
             loader_kwargs = {
                 'batch_size': None,

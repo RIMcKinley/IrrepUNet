@@ -44,11 +44,61 @@ class ZScoreNormalization:
     When use_mask_for_norm=False:
         - Computes mean/std on entire image
         - Normalizes entire image
+
+    Two outlier-robust variants for the mean/std used in z-scoring
+    (output image retains the raw values, only statistics are tempered):
+
+    * ``clip_percentile=(lo, hi)`` — always trims the tails at fixed
+      quantiles.  Disturbs clean distributions slightly (<1% of voxels).
+    * ``sigma_clip=k`` with optional ``sigma_clip_iter`` (default 3) —
+      iteratively rejects voxels beyond k·σ of the current mean and
+      recomputes.  For a clean distribution no voxels exceed the
+      threshold and it reduces to plain mean/std (no disturbance); for
+      outlier-heavy distributions the rejection shrinks the std back to
+      the bulk scale in 1–3 iterations.  Preferred over percentile
+      clipping when the fraction of outliers varies case to case.
+
+    If both are set, ``sigma_clip`` is applied first (after which the
+    bulk statistics are already robust, so percentile clipping typically
+    becomes a no-op).
     """
 
-    def __init__(self, use_mask_for_norm: bool = False, intensity_properties: dict = None):
+    def __init__(self, use_mask_for_norm: bool = False, intensity_properties: dict = None,
+                 clip_percentile: tuple = None,
+                 sigma_clip: float = None, sigma_clip_iter: int = 3):
         self.use_mask_for_norm = use_mask_for_norm
         self.intensity_properties = intensity_properties
+        self.clip_percentile = clip_percentile
+        self.sigma_clip = sigma_clip
+        self.sigma_clip_iter = sigma_clip_iter
+
+    def _stats(self, values):
+        """Compute (mean, std), with optional sigma-clipping and/or percentile clipping."""
+        vals = np.asarray(values)
+        if self.sigma_clip is not None and vals.size > 0:
+            mask = np.ones_like(vals, dtype=bool)
+            for _ in range(max(1, self.sigma_clip_iter)):
+                m = float(vals[mask].mean())
+                s = float(vals[mask].std())
+                if s <= 0:
+                    break
+                new_mask = (vals >= m - self.sigma_clip * s) & (vals <= m + self.sigma_clip * s)
+                if int(new_mask.sum()) == int(mask.sum()):
+                    mask = new_mask
+                    break
+                mask = new_mask
+                if int(mask.sum()) < 10:
+                    break
+            vals = vals[mask]
+        if self.clip_percentile is not None and vals.size > 0:
+            lo_p, hi_p = self.clip_percentile
+            lo = float(np.percentile(vals, lo_p))
+            hi = float(np.percentile(vals, hi_p))
+            vals = np.clip(vals, lo, hi)
+        if vals.size == 0:
+            # Fallback: original values
+            vals = np.asarray(values)
+        return float(vals.mean()), float(vals.std())
 
     def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
         image = image.astype(np.float32, copy=True)
@@ -58,13 +108,11 @@ class ZScoreNormalization:
             # In nnUNet, seg == -1 marks "outside" region
             mask = seg >= 0
             if mask.sum() > 0:
-                mean = image[mask].mean()
-                std = image[mask].std()
+                mean, std = self._stats(image[mask])
                 image[mask] = (image[mask] - mean) / max(std, 1e-8)
         else:
             # Global normalization (entire image)
-            mean = image.mean()
-            std = image.std()
+            mean, std = self._stats(image)
             image = (image - mean) / max(std, 1e-8)
 
         return image
@@ -95,17 +143,20 @@ class CTNormalization:
         return image
 
 
-def get_normalizer(scheme: str, use_mask_for_norm: bool, intensity_properties: dict = None):
+def get_normalizer(scheme: str, use_mask_for_norm: bool, intensity_properties: dict = None,
+                   clip_percentile: tuple = None):
     """Get normalizer instance based on scheme name."""
     if scheme == 'ZScoreNormalization':
-        return ZScoreNormalization(use_mask_for_norm, intensity_properties)
+        return ZScoreNormalization(use_mask_for_norm, intensity_properties,
+                                   clip_percentile=clip_percentile)
     elif scheme == 'CTNormalization':
         return CTNormalization(use_mask_for_norm, intensity_properties)
     elif scheme == 'NoNormalization':
         return None
     else:
         print(f"Warning: Unknown normalization scheme '{scheme}', using ZScoreNormalization")
-        return ZScoreNormalization(use_mask_for_norm, intensity_properties)
+        return ZScoreNormalization(use_mask_for_norm, intensity_properties,
+                                   clip_percentile=clip_percentile)
 
 
 def reorient_to_ras(img: nib.Nifti1Image) -> nib.Nifti1Image:

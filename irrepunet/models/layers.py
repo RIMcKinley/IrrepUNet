@@ -897,9 +897,10 @@ class PyramidVoxelConvolution(VoxelConvolution):
 
         ``tp.right`` runs **once** on the full native lattice.
 
-        ``spacing_scale`` is accepted for signature parity with
-        :meth:`VoxelConvolution.kernel`; pyramid-kernel jitter is not yet
-        implemented, so a non-None value is currently ignored.
+        ``spacing_scale`` (3-tuple) rescales the lattice positions only for
+        the SH / RBF evaluation — the integer kernel voxel grid, the
+        pyramid-level strides/slices and the scatter membership are all
+        untouched, so pooling and architecture stay fixed.
         """
         # Clamp K to available logits (spacing changes can increase K
         # beyond the parameter size allocated at __init__).
@@ -907,9 +908,27 @@ class PyramidVoxelConvolution(VoxelConvolution):
         alpha = F.softplus(self.pyramid_logits[:K])
         native_shape = tuple(self.lattice.shape[:3])
 
-        # Single TP evaluation
-        weight = self.emb @ self.weight
-        native_kernel = self.tp.right(self.sh, weight)
+        if spacing_scale is None:
+            weight = self.emb @ self.weight
+            native_kernel = self.tp.right(self.sh, weight)
+        else:
+            # Rescale lattice positions, recompute SH and RBF at the
+            # jittered points.  Integer grid, membership and level
+            # strides/slices stay fixed — only the kernel values shift.
+            scale = self.lattice.new_tensor(spacing_scale)
+            jittered = self.lattice * scale
+            emb = soft_one_hot_linspace(
+                x=jittered.float().norm(dim=-1),
+                start=0.0, end=self.diameter / 2,
+                number=self.num_radial_basis,
+                basis='smooth_finite', cutoff=self.cutoff,
+            ).to(dtype=self.emb.dtype)
+            sh = o3.spherical_harmonics(
+                l=self.irreps_sh, x=jittered.float(),
+                normalize=True, normalization='component',
+            ).to(dtype=self.sh.dtype)
+            weight = emb @ self.weight
+            native_kernel = self.tp.right(sh, weight)
 
         if self.pyramid_mode == "scatter":
             # Dot the per-voxel membership with alpha → per-voxel scalar weight

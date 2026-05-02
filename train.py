@@ -965,9 +965,11 @@ class ExperimentPlanner:
             max_inplane_spacing = getattr(self.args, 'max_inplane_spacing', 0.0)
             min_slice_thickness = getattr(self.args, 'min_slice_thickness', 0.0)
             max_slice_thickness = getattr(self.args, 'max_slice_thickness', 0.0)
+            dual_assign = getattr(self.args, 'dual_assign_ambiguous', False)
             spacing_groups = group_cases_by_spacing(
                 all_properties, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+                dual_assign_ambiguous=dual_assign)
         else:
             # Use original metadata only
             train_metadata = {cid: metadata[cid] for cid in train_cases}
@@ -975,9 +977,11 @@ class ExperimentPlanner:
             max_inplane_spacing = getattr(self.args, 'max_inplane_spacing', 0.0)
             min_slice_thickness = getattr(self.args, 'min_slice_thickness', 0.0)
             max_slice_thickness = getattr(self.args, 'max_slice_thickness', 0.0)
+            dual_assign = getattr(self.args, 'dual_assign_ambiguous', False)
             spacing_groups = group_cases_by_spacing(
                 train_metadata, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+                dual_assign_ambiguous=dual_assign)
             all_properties = train_metadata
 
         print(f"  Resolution groups: {len(spacing_groups)}")
@@ -1011,25 +1015,36 @@ class ExperimentPlanner:
         self._profile_spacings = {}  # canonical_spacing → profile_spacing
         patch_configs = []
         worst_case_info = []
+        use_group_sp = getattr(self.args, 'use_group_spacing', False)
         for spacing, cases in eligible_groups:
             patch_voxels = self.compute_patch_size_voxels(spacing)
             canonical_vol = _activation_volume(spacing, scales, patch_voxels)
 
-            # Find worst-case actual spacing in this group
-            worst_spacing = spacing
-            worst_vol = canonical_vol
-            actual_spacings = set()
-            for cid in cases:
-                props = all_properties.get(cid)
-                if props is not None:
-                    sp = tuple(sorted(props['spacing']))
-                    actual_spacings.add(sp)
-            for sp in actual_spacings:
-                # Compute patch_voxels at canonical spacing (matches training)
-                vol = _activation_volume(sp, scales, patch_voxels)
-                if vol > worst_vol:
-                    worst_vol = vol
-                    worst_spacing = sp
+            if use_group_sp:
+                # Training snaps cases to canonical spacing at runtime, so
+                # profiling at canonical matches what the model actually sees.
+                # (Without this, the planner picks a worst-case native that
+                # can cross architecture-key boundaries — e.g. 1.0-iso profiled
+                # at (1.0, 1.016, 1.016) measures 2x the canonical memory.)
+                worst_spacing = spacing
+                worst_vol = canonical_vol
+            else:
+                # Find worst-case actual spacing in this group so profiling
+                # doesn't underestimate memory for the native-spacing training.
+                worst_spacing = spacing
+                worst_vol = canonical_vol
+                actual_spacings = set()
+                for cid in cases:
+                    props = all_properties.get(cid)
+                    if props is not None:
+                        sp = tuple(sorted(props['spacing']))
+                        actual_spacings.add(sp)
+                for sp in actual_spacings:
+                    # Compute patch_voxels at canonical spacing (matches training)
+                    vol = _activation_volume(sp, scales, patch_voxels)
+                    if vol > worst_vol:
+                        worst_vol = vol
+                        worst_spacing = sp
 
             if worst_spacing != spacing:
                 ratio = worst_vol / canonical_vol
@@ -1491,6 +1506,7 @@ class ExperimentPlanner:
                 "scale_jitter_std": getattr(self.args, 'scale_jitter_std', 0.0),
                 "num_workers": self.args.num_workers,
                 "init_checkpoint": getattr(self.args, 'init_checkpoint', None),
+                "fixed_lr": getattr(self.args, 'fixed_lr', False),
                 "wandb": getattr(self.args, 'wandb', False),
                 "wandb_project": getattr(self.args, 'wandb_project', 'irrepunet'),
                 "wandb_name": getattr(self.args, 'wandb_name', None),
@@ -1506,12 +1522,15 @@ class ExperimentPlanner:
                 "max_slice_thickness": getattr(self.args, 'max_slice_thickness', 0.0),
                 "spacing_grid": getattr(self.args, 'spacing_grid_values', None),
                 "min_loader_cases": getattr(self.args, 'min_loader_cases', 2),
-                "group_balance": getattr(self.args, 'group_balance', 0.0),
+                "sampling_temperature": getattr(self.args, 'sampling_temperature', 1.0),
+                "mixed_group_real_floor": getattr(self.args, 'mixed_group_real_floor', 0.25),
+                "dual_assign_ambiguous": getattr(self.args, 'dual_assign_ambiguous', False),
                 "bias_field": getattr(self.args, 'bias_field', True),
                 "curriculum": getattr(self.args, 'curriculum', None),
                 "curriculum_bs_tiers": getattr(self.args, 'curriculum_bs_tiers', None),
                 "curriculum_phase_len": getattr(self.args, 'curriculum_phase_len', 30),
                 "use_group_spacing": getattr(self.args, 'use_group_spacing', False),
+                "native_kernel_scale": getattr(self.args, 'native_kernel_scale', False),
             },
 
             "hardware": {
@@ -2396,7 +2415,9 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         min_slice_thickness=getattr(args, 'min_slice_thickness', 0.0),
         max_slice_thickness=getattr(args, 'max_slice_thickness', 0.0),
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
-        group_balance=getattr(args, 'group_balance', 0.0),
+        sampling_temperature=getattr(args, 'sampling_temperature', 1.0),
+        mixed_group_real_floor=getattr(args, 'mixed_group_real_floor', 0.25),
+        dual_assign_ambiguous=getattr(args, 'dual_assign_ambiguous', False),
         planned_batch_sizes=planned_batch_sizes,
         planned_patch_sizes_mm=planned_patch_sizes_mm,
         rank=rank,
@@ -2563,7 +2584,12 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
     optimizer = AdamW(raw_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
+    if getattr(args, 'fixed_lr', False):
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        if is_main:
+            print(f"Using fixed learning rate {args.lr}")
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
 
     # Plan validation: compare runtime args against planned config.json
     if is_main:
@@ -2797,24 +2823,54 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         images = batch['data'].to(device, dtype=input_dtype)
                         labels = batch['seg'].to(device).long().squeeze(1)
 
-                    # Apply resolution jitter if enabled.
-                    # With use_group_spacing, jitter only affects kernel
-                    # weights (SH/RBF), not kernel voxel size or pooling.
+                    # Kernel-scale handling.
+                    #
+                    # With use_group_spacing=True AND native_kernel_scale=True,
+                    # the architecture is fixed at the subloader's canonical
+                    # spacing and each batch member's native mm positions are
+                    # fed to the kernel via ``spacing_scale`` — so the SH/RBF
+                    # evaluation reflects the true (off-grid) native, but
+                    # pool cascade, kernel voxel sizes, and per-level shapes
+                    # stay invariant.  Optional resolution jitter then adds
+                    # a small random perturbation on top of that
+                    # native-proportional scale.
+                    #
+                    # With use_group_spacing=True and native_kernel_scale=False
+                    # (legacy default), the kernel sees the canonical
+                    # spacing exactly — resolution_jitter_sigma may still
+                    # add random jitter on top.
+                    #
+                    # Without use_group_spacing, resolution jitter instead
+                    # nudges the input spacing itself (which can trigger an
+                    # architecture rebuild).
                     spacing_scale = None
-                    if args.resolution_jitter_sigma > 0:
-                        jitter = np.random.normal(0, args.resolution_jitter_sigma, 3)
-                        if getattr(args, 'use_group_spacing', False):
-                            # Kernel-weight-only jitter: compute per-axis scale
-                            # factors that shift the lattice mm positions.
+                    use_group_sp = getattr(args, 'use_group_spacing', False)
+                    use_native_kernel = getattr(args, 'native_kernel_scale', False)
+                    if use_group_sp:
+                        if use_native_kernel:
                             spacing_scale = tuple(
-                                max(0.5, 1.0 + j / s)
-                                for s, j in zip(spacing, jitter)
+                                max(0.5, float(n) / float(c))
+                                for n, c in zip(native_sp, spacing)
                             )
-                            jittered_spacing = spacing  # keep canonical
-                        else:
-                            jittered_spacing = tuple(
-                                max(0.1, s + j) for s, j in zip(spacing, jitter)
-                            )
+                        if args.resolution_jitter_sigma > 0:
+                            jitter = np.random.normal(
+                                0, args.resolution_jitter_sigma, 3)
+                            if spacing_scale is None:
+                                spacing_scale = tuple(
+                                    max(0.5, 1.0 + j / s)
+                                    for s, j in zip(spacing, jitter)
+                                )
+                            else:
+                                spacing_scale = tuple(
+                                    max(0.5, r * (1.0 + j))
+                                    for r, j in zip(spacing_scale, jitter)
+                                )
+                        jittered_spacing = spacing  # canonical
+                    elif args.resolution_jitter_sigma > 0:
+                        jitter = np.random.normal(0, args.resolution_jitter_sigma, 3)
+                        jittered_spacing = tuple(
+                            max(0.1, s + j) for s, j in zip(spacing, jitter)
+                        )
                     else:
                         jittered_spacing = spacing
 
@@ -2963,7 +3019,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 # Legacy: sample proportionally by weight
                 group_iter = None
 
-            def _val_forward(images, labels, spacing):
+            def _val_forward(images, labels, spacing, spacing_scale=None):
                 """Run val forward on images, handling max_val_batch_size slicing."""
                 all_preds = []
                 total_loss = 0.0
@@ -2975,7 +3031,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                     sub_img = images[start:end]
                     sub_lbl = labels[start:end]
                     with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                        out = raw_model(sub_img, spacing=spacing)
+                        out = raw_model(sub_img, spacing=spacing, spacing_scale=spacing_scale)
                         if args.deep_supervision:
                             # Mirror the training loop: drop 0-size spatial
                             # levels before computing multi-scale targets.
@@ -2992,6 +3048,10 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 return torch.cat(all_preds, dim=0), total_loss / n_sub
 
             if group_iter is not None:
+                _use_native_kernel_val = (
+                    getattr(args, 'use_group_spacing', False)
+                    and getattr(args, 'native_kernel_scale', False)
+                )
                 for spacing, loader in group_iter:
                     group_patches = 0
                     while group_patches < val_patches_per_group:
@@ -3002,7 +3062,17 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         labels = batch['seg'].to(device).long().squeeze(1)
                         batch_size = images.shape[0]
 
-                        preds, val_batch_loss = _val_forward(images, labels, spacing)
+                        val_spacing_scale = None
+                        if _use_native_kernel_val and 'spacings' in batch and len(batch['spacings']) > 0:
+                            idx = int(np.random.randint(len(batch['spacings'])))
+                            native_sp_val = tuple(float(s) for s in batch['spacings'][idx])
+                            val_spacing_scale = tuple(
+                                max(0.5, n / float(c))
+                                for n, c in zip(native_sp_val, spacing)
+                            )
+
+                        preds, val_batch_loss = _val_forward(images, labels, spacing,
+                                                             spacing_scale=val_spacing_scale)
                         val_loss += val_batch_loss
                         n_val_batches += 1
 
@@ -3041,16 +3111,26 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 while n_val_patches < args.val_patches:
                     batch, spacing = next(val_loader)
 
-                    # Override with group spacing if requested
+                    # Override with group spacing if requested; pass
+                    # native-proportional kernel scale if native_kernel_scale
+                    # is set (matches training-time kernel sampling).
+                    val_spacing_scale = None
                     if getattr(args, 'use_group_spacing', False):
+                        native_sp_val = spacing
                         spacing = batch.get('group_spacing', spacing)
+                        if getattr(args, 'native_kernel_scale', False):
+                            val_spacing_scale = tuple(
+                                max(0.5, float(n) / float(c))
+                                for n, c in zip(native_sp_val, spacing)
+                            )
 
                     input_dtype = amp_dtype
                     images = batch['data'].to(device, dtype=input_dtype)
                     labels = batch['seg'].to(device).long().squeeze(1)
                     batch_size = images.shape[0]
 
-                    preds, val_batch_loss = _val_forward(images, labels, spacing)
+                    preds, val_batch_loss = _val_forward(images, labels, spacing,
+                                                         spacing_scale=val_spacing_scale)
                     val_loss += val_batch_loss
                     n_val_batches += 1
 
@@ -3365,6 +3445,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['scale_jitter_std'] = training.get('scale_jitter_std', 0.0)
     args_dict['num_workers'] = training['num_workers']
     args_dict['lr'] = args_dict.pop('learning_rate')
+    args_dict['fixed_lr'] = training.get('fixed_lr', False)
 
     # Augmentation arguments
     aug = config['augmentation']
@@ -3377,12 +3458,15 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['max_slice_thickness'] = aug.get('max_slice_thickness', 0.0)
     args_dict['spacing_grid_values'] = aug.get('spacing_grid', None)
     args_dict['min_loader_cases'] = aug.get('min_loader_cases', 2)
-    args_dict['group_balance'] = aug.get('group_balance', 0.0)
+    args_dict['sampling_temperature'] = aug.get('sampling_temperature', 1.0)
+    args_dict['mixed_group_real_floor'] = aug.get('mixed_group_real_floor', 0.25)
+    args_dict['dual_assign_ambiguous'] = aug.get('dual_assign_ambiguous', False)
     args_dict['bias_field'] = aug.get('bias_field', True)
     args_dict['curriculum'] = aug.get('curriculum', None)
     args_dict['curriculum_bs_tiers'] = aug.get('curriculum_bs_tiers', None)
     args_dict['curriculum_phase_len'] = aug.get('curriculum_phase_len', 30)
     args_dict['use_group_spacing'] = aug.get('use_group_spacing', False)
+    args_dict['native_kernel_scale'] = aug.get('native_kernel_scale', False)
 
     # Hardware arguments
     hw = config['hardware']
@@ -3514,6 +3598,9 @@ def main():
                                  'collapse to a single bottleneck voxel per axis.  Default 1.')
     train_group.add_argument('--lr', type=float, default=0.01,
                             help='Learning rate (default: 0.01)')
+    train_group.add_argument('--fixed_lr', action='store_true',
+                            help='Use a fixed learning rate (no scheduler decay). '
+                                 'Default is cosine annealing from --lr to 1e-7.')
     train_group.add_argument('--weight_decay', type=float, default=3e-5,
                             help='Weight decay (default: 3e-5)')
     train_group.add_argument('--grad_clip', type=float, default=12.0,
@@ -3535,9 +3622,14 @@ def main():
     train_group.add_argument('--subsample_weight', type=float, default=0.0,
                             help='Weight for preprocessed subsampled data (default: 0.0, disabled). '
                                  'Use preprocess.py subsample to create subsampled versions first.')
-    train_group.add_argument('--group_balance', type=float, default=0.0,
-                            help='Balance sampling across resolution groups (default: 0.0). '
-                                 '0=proportional to case count, 1=uniform across groups.')
+    train_group.add_argument('--sampling_temperature', type=float, default=1.0,
+                            help='Temperature applied to resolution-group sampling weights '
+                                 '(default: 1.0). w <- w^t before renormalising. '
+                                 't=1 proportional to case count, t<1 flattens, t=0 uniform.')
+    train_group.add_argument('--mixed_group_real_floor', type=float, default=0.25,
+                            help='Within mixed (orig+sub) groups, floor the combined sampling '
+                                 'probability of original cases at this value (default: 0.25). '
+                                 'Leaves pure-orig/pure-sub groups uniform.')
     train_group.add_argument('--curriculum', type=int, nargs='+', default=None, metavar='EPOCH',
                             help='Staged resolution introduction at these epoch boundaries. '
                                  'E.g., --curriculum 10 20 30 introduces groups in 4 stages: '
@@ -3601,6 +3693,17 @@ def main():
     aug_group.add_argument('--use_group_spacing', action='store_true',
                           help='Use canonical group spacing for model instead of per-case native spacing. '
                                'Replicates JAX JIT behavior for controlled comparison.')
+    aug_group.add_argument('--native_kernel_scale', action='store_true',
+                          help='With --use_group_spacing, keep the architecture at the canonical spacing '
+                               'but let the kernel (SH/RBF) see each batch member\'s native mm positions via '
+                               'spacing_scale. Architecture stays invariant per subloader; kernel sampling '
+                               'follows the actual native spacing distribution. No effect without '
+                               '--use_group_spacing.')
+    aug_group.add_argument('--dual_assign_ambiguous', action='store_true',
+                          help='Assign cases whose native in-plane or slice-thickness sits near the midpoint '
+                               'of its bracketing grid cell to BOTH adjacent canonicals. Cleanly samples '
+                               'borderline cases under either interpretation — mirrors inference-time '
+                               'spacing_ensemble semantics on the training side. No GPU profiling needed.')
     aug_group.add_argument('--no_background_dice', action='store_true',
                           help='Exclude background class from Dice loss (foreground only)')
     aug_group.add_argument('--batch_dice', action='store_true',

@@ -1,7 +1,7 @@
 """Model architectures for e3nnUNet."""
 
 # distill.py only depends on PyTorch (not e3nn), safe to import first
-from .distill import project_to_spacing, architecture_spacing_range, update_projected_weights, optimal_scales_for_spacing, export_hierarchical_bundle, compute_architecture_key, compute_kernel_sizes, optimize_pooling_scales, optimize_bottleneck_kernels, _assemble_state_dict
+from .distill import project_to_spacing, architecture_spacing_range, update_projected_weights, jitter_projected_kernels, optimal_scales_for_spacing, export_hierarchical_bundle, compute_architecture_key, compute_kernel_sizes, optimize_pooling_scales, optimize_bottleneck_kernels, _assemble_state_dict
 
 # e3nn-dependent imports (optional in JAX-only environments)
 try:
@@ -49,6 +49,7 @@ __all__ = [
     "project_to_spacing",
     "architecture_spacing_range",
     "update_projected_weights",
+    "jitter_projected_kernels",
     "optimal_scales_for_spacing",
     "SPACING_DEPENDENT_BUFFERS",
     "spacing_independent_state_dict",

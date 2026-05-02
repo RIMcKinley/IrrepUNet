@@ -98,13 +98,15 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     aug = config['augmentation']
     args_dict['disable_spatial'] = aug.get('disable_spatial', True)
     args_dict['disable_mirroring'] = aug['disable_mirroring']
+    args_dict['bias_field'] = aug.get('bias_field', True)
+    args_dict['disable_intensity'] = aug.get('disable_intensity', False)
     args_dict['subsample_weight'] = aug['subsample_weight']
     args_dict['min_spacing'] = aug.get('min_spacing', 0.0)
     args_dict['max_inplane_spacing'] = aug.get('max_inplane_spacing', 0.0)
     args_dict['min_slice_thickness'] = aug.get('min_slice_thickness', 0.0)
     args_dict['max_slice_thickness'] = aug.get('max_slice_thickness', 0.0)
     args_dict['min_loader_cases'] = aug.get('min_loader_cases', 2)
-    args_dict['group_balance'] = aug.get('group_balance', 0.0)
+    args_dict['sampling_temperature'] = aug.get('sampling_temperature', 1.0)
     args_dict['curriculum'] = aug.get('curriculum', None)
     args_dict['curriculum_bs_tiers'] = aug.get('curriculum_bs_tiers', None)
     args_dict['curriculum_phase_len'] = aug.get('curriculum_phase_len', 30)

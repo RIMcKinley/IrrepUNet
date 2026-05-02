@@ -60,6 +60,43 @@ def round_spacing_to_tolerance(spacing: tuple, grid: tuple = None) -> tuple:
     return tuple(round_to_grid(s, grid=grid) for s in spacing)
 
 
+def _grid_neighbors(value: float, grid=None):
+    """Return (lo, hi) grid points bracketing ``value``.
+
+    Falls back to (value, value) when ``value`` is exactly on a grid point
+    or sits outside the grid entirely.
+    """
+    if grid is None:
+        grid = SPACING_GRID
+    below = [g for g in grid if g <= value]
+    above = [g for g in grid if g >= value]
+    lo = max(below) if below else grid[0]
+    hi = min(above) if above else grid[-1]
+    return lo, hi
+
+
+def _ambiguous_candidates(value: float, grid=None, ambiguity_threshold: float = 0.25):
+    """Return the grid values ``value`` should snap to.
+
+    Returns a list of one or two grid points.  When ``value`` sits near
+    the midpoint of its bracketing grid cell (``frac`` in
+    ``[0.5 - ambiguity_threshold, 0.5 + ambiguity_threshold]``), returns
+    both bracketing grid values so an ambiguous case can feed both
+    canonical groups during training.  Otherwise returns only the single
+    nearest grid point.
+    """
+    if grid is None:
+        grid = SPACING_GRID
+    lo, hi = _grid_neighbors(value, grid)
+    if hi <= lo:
+        return [lo]
+    frac = (value - lo) / (hi - lo)
+    nearest = lo if frac < 0.5 else hi
+    if ambiguity_threshold > 0 and 0.5 - ambiguity_threshold <= frac <= 0.5 + ambiguity_threshold:
+        return [lo, hi]
+    return [nearest]
+
+
 def group_cases_by_spacing(
     properties: Dict[str, dict],
     min_spacing: float = 0.0,
@@ -67,6 +104,8 @@ def group_cases_by_spacing(
     min_slice_thickness: float = 0.0,
     max_slice_thickness: float = 0.0,
     inplane_tolerance: float = 0.1,
+    dual_assign_ambiguous: bool = False,
+    ambiguity_threshold: float = 0.25,
 ) -> Dict[tuple, List[str]]:
     """Group cases by their spacing using tiered tolerance rounding.
 
@@ -138,15 +177,19 @@ def group_cases_by_spacing(
         # that float noise at grid midpoints (e.g. (2.75, 2.75, ...)) cannot
         # split the pair across adjacent grid cells.
         ip_mean = (canonical_spacing[0] + canonical_spacing[1]) / 2
-        ip_rounded = round_to_grid(ip_mean)
-        sl_rounded = round_to_grid(canonical_spacing[2])
-        rounded_spacing = (ip_rounded, ip_rounded, sl_rounded)
 
-        # Find matching group (using rounded spacing as key)
-        if rounded_spacing in groups:
-            groups[rounded_spacing].append(case_name)
+        if dual_assign_ambiguous:
+            ip_targets = _ambiguous_candidates(ip_mean, ambiguity_threshold=ambiguity_threshold)
+            sl_targets = _ambiguous_candidates(canonical_spacing[2], ambiguity_threshold=ambiguity_threshold)
+            for ip_r in ip_targets:
+                for sl_r in sl_targets:
+                    rs = (ip_r, ip_r, sl_r)
+                    groups.setdefault(rs, []).append(case_name)
         else:
-            groups[rounded_spacing] = [case_name]
+            ip_rounded = round_to_grid(ip_mean)
+            sl_rounded = round_to_grid(canonical_spacing[2])
+            rounded_spacing = (ip_rounded, ip_rounded, sl_rounded)
+            groups.setdefault(rounded_spacing, []).append(case_name)
 
     if dropped_anisotropic > 0:
         print(f"  Dropped {dropped_anisotropic} cases with in-plane anisotropy > "

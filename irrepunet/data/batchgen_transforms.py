@@ -18,6 +18,30 @@ from batchgenerators.transforms.abstract_transforms import AbstractTransform
 from batchgenerators.transforms.utility_transforms import NumpyToTensor
 
 
+class RMSNormalizeTransform(AbstractTransform):
+    """Normalize each sample to unit RMS: ``x /= sqrt(mean(x^2))``.
+
+    Mirrors the per-patch normalization in the Diaz CAIM dataset
+    (`x /= x.pow(2).mean().sqrt()`).  Applied per-sample, per-channel.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        self.eps = eps
+
+    def __call__(self, **data_dict):
+        data = data_dict.get('data')
+        if data is None:
+            return data_dict
+        # data is (B, C, D, H, W); normalize each sample independently
+        for b in range(data.shape[0]):
+            sample = data[b]
+            rms = float(np.sqrt(np.mean(sample.astype(np.float64) ** 2)))
+            if rms > self.eps:
+                data[b] = sample / rms
+        data_dict['data'] = data
+        return data_dict
+
+
 class BiasFieldTransform(AbstractTransform):
     """Random MRI bias field augmentation via torchio.
 
@@ -60,8 +84,15 @@ def get_training_transforms(
     disable_spatial: bool = False,
     disable_low_res_sim: bool = True,
     bias_field: bool = True,
+    disable_intensity: bool = False,
+    per_patch_rms: bool = False,
 ) -> Compose:
-    """Get nnUNet-style training transforms."""
+    """Get nnUNet-style training transforms.
+
+    ``disable_intensity`` skips Gaussian noise/blur, brightness, contrast,
+    bias field, and gamma transforms — combined with ``disable_spatial``
+    and ``disable_mirroring`` it produces a no-augmentation pipeline.
+    """
     transforms = []
 
     # Spatial transforms
@@ -89,43 +120,44 @@ def get_training_transforms(
             )
         )
 
-    # Gaussian noise
-    transforms.append(
-        GaussianNoiseTransform(
-            noise_variance=(0, 0.1),
-            p_per_sample=0.1,
-            p_per_channel=1.0,
+    if not disable_intensity:
+        # Gaussian noise
+        transforms.append(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.1),
+                p_per_sample=0.1,
+                p_per_channel=1.0,
+            )
         )
-    )
 
-    # Gaussian blur
-    transforms.append(
-        GaussianBlurTransform(
-            blur_sigma=(0.5, 1.0),
-            different_sigma_per_channel=True,
-            p_per_sample=0.2,
-            p_per_channel=0.5,
+        # Gaussian blur
+        transforms.append(
+            GaussianBlurTransform(
+                blur_sigma=(0.5, 1.0),
+                different_sigma_per_channel=True,
+                p_per_sample=0.2,
+                p_per_channel=0.5,
+            )
         )
-    )
 
-    # Brightness
-    transforms.append(
-        BrightnessMultiplicativeTransform(
-            multiplier_range=(0.75, 1.25),
-            p_per_sample=0.15,
+        # Brightness
+        transforms.append(
+            BrightnessMultiplicativeTransform(
+                multiplier_range=(0.75, 1.25),
+                p_per_sample=0.15,
+            )
         )
-    )
 
-    # Contrast
-    transforms.append(
-        ContrastAugmentationTransform(
-            contrast_range=(0.75, 1.25),
-            p_per_sample=0.15,
+        # Contrast
+        transforms.append(
+            ContrastAugmentationTransform(
+                contrast_range=(0.75, 1.25),
+                p_per_sample=0.15,
+            )
         )
-    )
 
     # Random MRI bias field (smooth multiplicative inhomogeneity)
-    if bias_field:
+    if bias_field and not disable_intensity:
         transforms.append(
             BiasFieldTransform(
                 coefficients=0.5,
@@ -149,24 +181,25 @@ def get_training_transforms(
         )
 
     # Gamma transforms
-    transforms.append(
-        GammaTransform(
-            gamma_range=(0.7, 1.5),
-            invert_image=True,
-            per_channel=True,
-            retain_stats=True,
-            p_per_sample=0.1,
+    if not disable_intensity:
+        transforms.append(
+            GammaTransform(
+                gamma_range=(0.7, 1.5),
+                invert_image=True,
+                per_channel=True,
+                retain_stats=True,
+                p_per_sample=0.1,
+            )
         )
-    )
-    transforms.append(
-        GammaTransform(
-            gamma_range=(0.7, 1.5),
-            invert_image=False,
-            per_channel=True,
-            retain_stats=True,
-            p_per_sample=0.3,
+        transforms.append(
+            GammaTransform(
+                gamma_range=(0.7, 1.5),
+                invert_image=False,
+                per_channel=True,
+                retain_stats=True,
+                p_per_sample=0.3,
+            )
         )
-    )
 
     # Mirroring
     if not disable_mirroring:
@@ -174,14 +207,20 @@ def get_training_transforms(
             MirrorTransform(axes=(0, 1, 2))
         )
 
+    # Per-patch RMS normalization (Diaz-style: img /= sqrt(mean(img**2)))
+    if per_patch_rms:
+        transforms.append(RMSNormalizeTransform())
+
     # Convert to tensor
     transforms.append(NumpyToTensor(keys=['data', 'seg'], cast_to='float'))
 
     return Compose(transforms)
 
 
-def get_validation_transforms() -> Compose:
+def get_validation_transforms(per_patch_rms: bool = False) -> Compose:
     """Get validation transforms (minimal, just convert to tensor)."""
-    return Compose([
-        NumpyToTensor(keys=['data', 'seg'], cast_to='float')
-    ])
+    transforms = []
+    if per_patch_rms:
+        transforms.append(RMSNormalizeTransform())
+    transforms.append(NumpyToTensor(keys=['data', 'seg'], cast_to='float'))
+    return Compose(transforms)

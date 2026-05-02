@@ -114,77 +114,123 @@ def _grid_neighbors(value, grid):
     return floor_val, ceil_val
 
 
-def spacing_ensemble_members(spacing, tolerance=0.05, ambiguity_threshold=0.25):
-    """Return the set of spacings to ensemble for a given native spacing.
+def snap_to_arch_canonical(model, spacing, max_axis_hops=2):
+    """Snap a spacing to a canonical point using a relaxed architecture match.
 
-    Per-axis classification:
-      - **off-canonical**: axis exceeds *tolerance* (relative) from its
-        nearest grid point.
-      - **ambiguous**: axis value sits near the midpoint between its two
-        bracketing grid points (``|frac - 0.5| <= ambiguity_threshold``,
-        with ``frac = (s - lo) / (hi - lo)``).
+    For each axis, consider the *max_axis_hops* nearest grid values (default 2:
+    the nearest plus one above and one below) and enumerate the cartesian
+    product.  Each candidate canonical is scored lexicographically by
+    ``(L0_match, total_matching_levels, -log_distance)`` — where ``L0_match``
+    is 1 iff the candidate shares the native's outermost-layer kernel size.
+    If the grid is sparse this reduces to the distance-nearest canonical.
+    """
+    import math
+    from .data.spacing import SPACING_GRID
+    from .models import compute_architecture_key
 
-    Ensemble only fires when every off-canonical axis is also ambiguous
-    — i.e. every axis that meaningfully disagrees with canonical is
-    genuinely in the "could go either way" zone.  If any axis is
-    clearly-closer-to-canonical but outside tolerance (e.g. 0.47 off 0.5,
-    6% rel — not ambiguous), we skip ensembling for that case because
-    averaging a biased neighbor into the prediction has been observed
-    empirically to hurt more than it helps.  Cases that *do* ensemble get
-    ``[native, canonical, alt]``, where ``alt`` flips each ambiguous axis
-    to the opposite grid neighbor.
+    native_arch = compute_architecture_key(model, spacing)
+    n_levels = len(native_arch)
+
+    per_axis = []
+    for d in range(3):
+        idx_sorted = sorted(range(len(SPACING_GRID)),
+                            key=lambda i: abs(SPACING_GRID[i] - spacing[d]))
+        per_axis.append([SPACING_GRID[i] for i in idx_sorted[:max_axis_hops + 1]])
+
+    best_score, best_cand = None, None
+    for c0 in per_axis[0]:
+        for c1 in per_axis[1]:
+            for c2 in per_axis[2]:
+                c = (c0, c1, c2)
+                arch = compute_architecture_key(model, c)
+                l0_match = int(arch[0] == native_arch[0])
+                n_match = sum(1 for i in range(n_levels) if arch[i] == native_arch[i])
+                dist = sum((math.log(c[d]) - math.log(spacing[d])) ** 2 for d in range(3))
+                score = (l0_match, n_match, -dist)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_cand = c
+    return best_cand
+
+
+def spacing_ensemble_members(spacing, tolerance=0.05, ambiguity_threshold=0.25,
+                             model=None):
+    """Return the canonical spacings to ensemble for a native spacing.
+
+    Mirrors training-time ``group_cases_by_spacing(dual_assign_ambiguous=True)``
+    so the inference ensemble covers exactly the canonical groups the case
+    would have been routed into during training.
+
+    Logic:
+      1. Identify the slice axis (largest native spacing) and the two
+         in-plane axes (the rest).
+      2. Average the two in-plane spacings into ``ip_mean`` and snap with
+         :func:`_ambiguous_candidates` — returns one or two grid points
+         (two when ip_mean sits in the middle ``2*ambiguity_threshold``
+         band of its bracketing grid cell).
+      3. Snap the slice axis the same way → one or two grid points.
+      4. Cartesian product → 1, 2, or 4 members.  Each member is
+         constructed in the **native axis order**: in-plane axes share
+         the in-plane grid value, slice axis gets the slice grid value.
+
+    No native spacing is included (matches training, which only sees the
+    canonical) and no off-canonical tolerance gate (training has none —
+    a case is dual-assigned purely on the ambiguity test).
 
     Parameters
     ----------
     spacing : tuple
         Native voxel spacing (3-tuple, mm).
     tolerance : float
-        Maximum relative distance to canonical before an axis counts as
-        off-canonical (default 0.05 = 5%).
+        **Unused** — kept for backward-compatible call sites.  The
+        previous implementation used this as an off-canonical guard;
+        the training-mirror logic has no such guard.
     ambiguity_threshold : float
-        Half-width of the ambiguous zone around the gap midpoint, as a
-        fraction of the floor/ceil gap (default 0.25 → ambiguous when
-        0.25 <= frac <= 0.75).
+        Half-width of the ambiguous zone around the gap midpoint
+        (default 0.25 → both grid neighbours returned when
+        ``0.25 <= frac <= 0.75``).  Must match the training-time value.
+    model : nn.Module, optional
+        If provided, also append the arch-matched canonical snap
+        (:func:`snap_to_arch_canonical`) when it differs from the members
+        produced above.  Adds at most one extra member.
     """
-    from .data.spacing import SPACING_GRID, round_spacing_to_tolerance
+    del tolerance  # unused; kept for API compatibility
+    from .data.spacing import _ambiguous_candidates
 
-    canonical = round_spacing_to_tolerance(spacing)
+    spacing = tuple(float(s) for s in spacing)
 
-    off_canonical_axes = [
-        i for i, (s, c) in enumerate(zip(spacing, canonical))
-        if abs(s - c) / max(c, 0.01) > tolerance
-    ]
-    ambiguous_axes = []
-    for i, s in enumerate(spacing):
-        lo, hi = _grid_neighbors(s, SPACING_GRID)
-        if hi <= lo:
-            continue
-        frac = (s - lo) / (hi - lo)
-        if 0.5 - ambiguity_threshold <= frac <= 0.5 + ambiguity_threshold:
-            ambiguous_axes.append(i)
+    # Identify in-plane (two smallest) and slice (largest) axes.
+    sorted_idx = sorted(range(3), key=lambda i: spacing[i])
+    inplane_axes = sorted_idx[:2]
+    slice_axis = sorted_idx[2]
 
-    # Ensemble only if every off-canonical axis is also ambiguous.  (Empty
-    # ambiguous_axes fails the condition, so no ambiguous axes → canonical
-    # only, regardless of how many are off-canonical.)
-    ensemble_ok = bool(ambiguous_axes) and all(
-        a in ambiguous_axes for a in off_canonical_axes
-    )
-    if not ensemble_ok:
-        return [canonical]
+    ip_mean = (spacing[inplane_axes[0]] + spacing[inplane_axes[1]]) / 2
+    sl_val = spacing[slice_axis]
 
-    alt = list(canonical)
-    for i in ambiguous_axes:
-        lo, hi = _grid_neighbors(spacing[i], SPACING_GRID)
-        alt[i] = hi if canonical[i] == lo else lo
-    alt = tuple(alt)
+    ip_targets = _ambiguous_candidates(ip_mean, ambiguity_threshold=ambiguity_threshold)
+    sl_targets = _ambiguous_candidates(sl_val, ambiguity_threshold=ambiguity_threshold)
 
-    members = [spacing, canonical]
-    is_dup = any(
-        all(abs(a - b) / max(a, b, 0.01) < 0.01 for a, b in zip(alt, existing))
-        for existing in members
-    )
-    if not is_dup:
-        members.append(alt)
+    def _add(members, sp):
+        is_dup = any(
+            all(abs(a - b) / max(a, b, 0.01) < 0.01 for a, b in zip(sp, existing))
+            for existing in members
+        )
+        if not is_dup:
+            members.append(tuple(sp))
+
+    members = []
+    for ip_r in ip_targets:
+        for sl_r in sl_targets:
+            sp = list(spacing)
+            sp[inplane_axes[0]] = ip_r
+            sp[inplane_axes[1]] = ip_r
+            sp[slice_axis] = sl_r
+            _add(members, sp)
+
+    if model is not None:
+        arch_canonical = snap_to_arch_canonical(model, spacing)
+        _add(members, arch_canonical)
+
     return members
 
 
@@ -274,6 +320,8 @@ def sliding_window_inference(
     n_downsample: Optional[int] = None,
     model_scale: Optional[float] = None,
     min_patches: int = 8,
+    per_patch_rms: bool = False,
+    logit_avg: bool = False,
 ) -> np.ndarray:
     """Batched sliding window inference with Gaussian weighting.
 
@@ -412,7 +460,12 @@ def sliding_window_inference(
             out = model(batch, _spacing) if _spacing is not None else model(batch)
         if isinstance(out, (list, tuple)):
             out = out[-1]
-        return F.softmax(out.float(), dim=1)
+        out = out.float()
+        # logit_avg: accumulate raw logits across overlapping patches and
+        # apply softmax once at the end (matches nnUNet predict_3D when the
+        # model's final_nonlin is Identity).  Default: per-patch softmax,
+        # then average probs.
+        return out if logit_avg else F.softmax(out, dim=1)
 
     print(f"Processing {n_patches} patches (patch_voxels={patch_voxels}, "
           f"sw_batch_size={sw_batch_size}, tta={n_combos}x)...")
@@ -426,6 +479,11 @@ def sliding_window_inference(
                 image_tensor[:, d:d+pd, h:h+ph, w:w+pw]
                 for d, h, w in batch_locs
             ]).to(device)
+            # Per-patch RMS normalization (Diaz-style)
+            if per_patch_rms:
+                rms = patches.float().pow(2).mean(dim=(1, 2, 3, 4),
+                                                  keepdim=True).sqrt()
+                patches = patches / rms.clamp(min=1e-8)
 
             # TTA: average predictions over flip combos
             pred_sum = None
@@ -450,6 +508,9 @@ def sliding_window_inference(
 
     # Normalize and crop back to original size
     output = output / weight_sum.clamp(min=1e-8)
+    if logit_avg:
+        # Convert averaged logits to probabilities once at the end
+        output = F.softmax(output, dim=1)
     output = output[:, :, pad_d0:pad_d0+D, pad_h0:pad_h0+H, pad_w0:pad_w0+W]
     return output[0].cpu().numpy()  # (C, D, H, W)
 
@@ -1311,13 +1372,21 @@ def predict_nifti(
     cropped = ras_data_4d[(slice(None),) + slices]
     print(f"  Cropped shape: {cropped.shape[1:]}")
 
-    # Z-score normalize (foreground mask only, matching training preprocessing)
-    fg_mask = cropped[0] != 0
-    fg_values = cropped[0][fg_mask]
+    # Z-score normalize using the same mask preprocess.py uses:
+    # ``binary_fill_holes(image != 0)``.  nnUNet's preprocess marks
+    # background voxels outside the nonzero bbox as seg_for_norm = -1,
+    # which leaves `seg_for_norm >= 0` equivalent to the filled nonzero
+    # mask (plus any label > 0 voxels, which always sit inside the fill).
+    # Using just `image != 0` here would miss ~0.05% of voxels per case
+    # in the filled-in "holes" of the tissue mask and produce slightly
+    # different stats than training saw — resulting in sub-percent Dice
+    # drift that mostly cancels but is non-zero on some cases.
+    nonzero_mask_crop = binary_fill_holes(cropped[0] != 0)
+    fg_values = cropped[0][nonzero_mask_crop]
     mean_val = float(fg_values.mean())
     std_val = float(fg_values.std())
     normalized = np.zeros_like(cropped)
-    normalized[0][fg_mask] = (cropped[0][fg_mask] - mean_val) / max(std_val, 1e-8)
+    normalized[0][nonzero_mask_crop] = (cropped[0][nonzero_mask_crop] - mean_val) / max(std_val, 1e-8)
 
     # Run inference (model projection handled automatically)
     reverse_transform = nib_orient.ornt_transform(ras_ornt, original_ornt)
