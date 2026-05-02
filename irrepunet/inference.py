@@ -53,8 +53,23 @@ def make_gaussian_importance_map(patch_size: tuple, sigma_scale: float = 0.125) 
 # Helpers
 # =============================================================================
 
-def _mm_to_voxels(patch_size_mm, spacing, img_shape):
-    """Convert mm patch size to voxels, clamped to image size."""
+def _mm_to_voxels(patch_size_mm, spacing, img_shape,
+                  n_downsample=None, model_scale=None):
+    """Convert mm patch size to voxels.
+
+    If ``n_downsample`` and ``model_scale`` are provided, the result is
+    rounded to the *nearest* multiple of the per-axis cumulative pool
+    factor — preferring the larger multiple when the raw count falls near
+    a midpoint.  After rounding, the result is clamped to the image size;
+    any remaining non-alignment is handled by the UNet's internal
+    reflect-pad-to-divisible path (which is correct, just slightly
+    wasteful on padding voxels).
+
+    Previous behaviour (floor) could lose up to one pool-factor of
+    coverage per axis (e.g. 170 voxels → 128 at pool factor 64, a 25%
+    reduction), causing many more sliding-window patches and reducing
+    per-patch context.
+    """
     if isinstance(patch_size_mm, (int, float)):
         patch_size_mm = (float(patch_size_mm),) * 3
     spacing_arr = np.array(spacing)
@@ -62,7 +77,20 @@ def _mm_to_voxels(patch_size_mm, spacing, img_shape):
         max(8, int(round(mm / sp)))
         for mm, sp in zip(patch_size_mm, spacing_arr)
     )
-    return tuple(min(pv, s) for pv, s in zip(patch_voxels, img_shape))
+
+    if n_downsample is not None and model_scale is not None:
+        from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
+        final_sp = compute_steps_through_pooling(tuple(spacing), n_downsample, model_scale)[-1]
+        pool_factors = tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
+        # Round to nearest multiple of pool_factor.  Do NOT clamp to
+        # image size here — _patch_starts handles dim < patch via
+        # padding, and that padding enables offset views for min_patches.
+        patch_voxels = tuple(
+            max(pf, ((pv + pf // 2) // pf) * pf)
+            for pv, pf in zip(patch_voxels, pool_factors)
+        )
+
+    return patch_voxels
 
 
 def _needs_projection(model):
@@ -74,17 +102,203 @@ def _needs_projection(model):
     return any(isinstance(m, VoxelConvolution) for m in model.modules())
 
 
-def _compute_padding(dim, patch, step):
-    """Compute reflect-padding for a perfectly regular patch grid.
+def _grid_neighbors(value, grid):
+    """Return the two grid values that bracket *value* (floor, ceil).
 
-    Without padding, the last patch snaps back to (dim - patch), creating
-    irregular overlap and position-dependent Gaussian weighting. This
-    computes the minimum padding so every position is exactly step apart.
+    If *value* exactly matches a grid point, both are that point.
+    """
+    below = [g for g in grid if g <= value]
+    above = [g for g in grid if g >= value]
+    floor_val = max(below) if below else grid[0]
+    ceil_val = min(above) if above else grid[-1]
+    return floor_val, ceil_val
+
+
+def snap_to_arch_canonical(model, spacing, max_axis_hops=2):
+    """Snap a spacing to a canonical point using a relaxed architecture match.
+
+    For each axis, consider the *max_axis_hops* nearest grid values (default 2:
+    the nearest plus one above and one below) and enumerate the cartesian
+    product.  Each candidate canonical is scored lexicographically by
+    ``(L0_match, total_matching_levels, -log_distance)`` — where ``L0_match``
+    is 1 iff the candidate shares the native's outermost-layer kernel size.
+    If the grid is sparse this reduces to the distance-nearest canonical.
+    """
+    import math
+    from .data.spacing import SPACING_GRID
+    from .models import compute_architecture_key
+
+    native_arch = compute_architecture_key(model, spacing)
+    n_levels = len(native_arch)
+
+    per_axis = []
+    for d in range(3):
+        idx_sorted = sorted(range(len(SPACING_GRID)),
+                            key=lambda i: abs(SPACING_GRID[i] - spacing[d]))
+        per_axis.append([SPACING_GRID[i] for i in idx_sorted[:max_axis_hops + 1]])
+
+    best_score, best_cand = None, None
+    for c0 in per_axis[0]:
+        for c1 in per_axis[1]:
+            for c2 in per_axis[2]:
+                c = (c0, c1, c2)
+                arch = compute_architecture_key(model, c)
+                l0_match = int(arch[0] == native_arch[0])
+                n_match = sum(1 for i in range(n_levels) if arch[i] == native_arch[i])
+                dist = sum((math.log(c[d]) - math.log(spacing[d])) ** 2 for d in range(3))
+                score = (l0_match, n_match, -dist)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_cand = c
+    return best_cand
+
+
+def spacing_ensemble_members(spacing, tolerance=0.05, ambiguity_threshold=0.25,
+                             model=None):
+    """Return the canonical spacings to ensemble for a native spacing.
+
+    Mirrors training-time ``group_cases_by_spacing(dual_assign_ambiguous=True)``
+    so the inference ensemble covers exactly the canonical groups the case
+    would have been routed into during training.
+
+    Logic:
+      1. Identify the slice axis (largest native spacing) and the two
+         in-plane axes (the rest).
+      2. Average the two in-plane spacings into ``ip_mean`` and snap with
+         :func:`_ambiguous_candidates` — returns one or two grid points
+         (two when ip_mean sits in the middle ``2*ambiguity_threshold``
+         band of its bracketing grid cell).
+      3. Snap the slice axis the same way → one or two grid points.
+      4. Cartesian product → 1, 2, or 4 members.  Each member is
+         constructed in the **native axis order**: in-plane axes share
+         the in-plane grid value, slice axis gets the slice grid value.
+
+    No native spacing is included (matches training, which only sees the
+    canonical) and no off-canonical tolerance gate (training has none —
+    a case is dual-assigned purely on the ambiguity test).
+
+    Parameters
+    ----------
+    spacing : tuple
+        Native voxel spacing (3-tuple, mm).
+    tolerance : float
+        **Unused** — kept for backward-compatible call sites.  The
+        previous implementation used this as an off-canonical guard;
+        the training-mirror logic has no such guard.
+    ambiguity_threshold : float
+        Half-width of the ambiguous zone around the gap midpoint
+        (default 0.25 → both grid neighbours returned when
+        ``0.25 <= frac <= 0.75``).  Must match the training-time value.
+    model : nn.Module, optional
+        If provided, also append the arch-matched canonical snap
+        (:func:`snap_to_arch_canonical`) when it differs from the members
+        produced above.  Adds at most one extra member.
+    """
+    del tolerance  # unused; kept for API compatibility
+    from .data.spacing import _ambiguous_candidates
+
+    spacing = tuple(float(s) for s in spacing)
+
+    # Identify in-plane (two smallest) and slice (largest) axes.
+    sorted_idx = sorted(range(3), key=lambda i: spacing[i])
+    inplane_axes = sorted_idx[:2]
+    slice_axis = sorted_idx[2]
+
+    ip_mean = (spacing[inplane_axes[0]] + spacing[inplane_axes[1]]) / 2
+    sl_val = spacing[slice_axis]
+
+    ip_targets = _ambiguous_candidates(ip_mean, ambiguity_threshold=ambiguity_threshold)
+    sl_targets = _ambiguous_candidates(sl_val, ambiguity_threshold=ambiguity_threshold)
+
+    def _add(members, sp):
+        is_dup = any(
+            all(abs(a - b) / max(a, b, 0.01) < 0.01 for a, b in zip(sp, existing))
+            for existing in members
+        )
+        if not is_dup:
+            members.append(tuple(sp))
+
+    members = []
+    for ip_r in ip_targets:
+        for sl_r in sl_targets:
+            sp = list(spacing)
+            sp[inplane_axes[0]] = ip_r
+            sp[inplane_axes[1]] = ip_r
+            sp[slice_axis] = sl_r
+            _add(members, sp)
+
+    if model is not None:
+        arch_canonical = snap_to_arch_canonical(model, spacing)
+        _add(members, arch_canonical)
+
+    return members
+
+
+def _compute_padding(dim, patch, step):
+    """[Legacy] Compute reflect-padding for a perfectly regular patch grid.
+
+    Kept for callers that still want the old "fixed step + reflect-pad"
+    behaviour; new code should use ``_patch_starts`` instead.
     """
     if dim <= patch:
         return 0
-    n_steps = -(-(dim - patch) // step)  # ceil division
+    n_steps = -(-(dim - patch) // step)
     return patch + n_steps * step - dim
+
+
+def _patch_starts(dim, patch, max_step, min_patches=2):
+    """Compute patch start positions covering ``[0, dim)`` with overlap as a
+    minimum constraint (``max_step = patch * (1 - min_overlap)``).
+
+    When ``dim > patch`` the patches are distributed evenly so the actual
+    stride between consecutive starts is ``(dim - patch) / (n - 1) <=
+    max_step``; the volume needs **no** padding.  When ``dim <= patch`` a
+    single patch is used and the volume must be reflect-padded by
+    ``patch - dim`` to fill the patch.
+
+    ``min_patches`` ensures at least that many positions per axis (default
+    2), so every voxel is predicted from multiple overlapping patches.
+    When the image is only slightly larger than the patch, this prevents
+    degenerate single-patch coverage.
+
+    The starts are constructed by rounding the first half of the positions
+    and mirroring them to the second half, so the set of positions is
+    symmetric under volume reflection (modulo at most a 1-voxel rounding
+    error at the centre when both ``n`` and ``travel`` are odd).  This
+    avoids subtle anterior/posterior or left/right sampling biases.
+
+    Returns
+    -------
+    starts : list of int
+        Patch start positions.
+    pad : int
+        Padding to add so the patches fit (only nonzero when ``dim <= patch``).
+    """
+    if dim <= patch:
+        total_pad = patch - dim
+        if min_patches >= 2 and total_pad > 0:
+            # Multiple offset views: shift the image within the patch so
+            # zero-padding fills different regions, giving the model
+            # varied boundary context to average over.
+            # Pad by total_pad on EACH side so all offsets fit.
+            offsets = [round(i * total_pad / (min_patches - 1))
+                       for i in range(min_patches)]
+            starts = [total_pad - o for o in offsets]
+            return starts, 2 * total_pad
+        return [0], total_pad
+    n_steps = (dim - patch + max_step - 1) // max_step  # ceil
+    n = max(n_steps + 1, min_patches)
+    if n <= 1:
+        return [0], 0
+    travel = dim - patch
+    # Round first half from index 0; mirror to second half.  This guarantees
+    # ``starts[i] + starts[n-1-i] == travel`` for all i ≠ middle.
+    starts = [0] * n
+    for i in range((n + 1) // 2):
+        s = round(i * travel / (n - 1))
+        starts[i] = s
+        starts[n - 1 - i] = travel - s
+    return starts, 0
 
 
 # =============================================================================
@@ -103,6 +317,11 @@ def sliding_window_inference(
     sw_batch_size: int = 4,
     native_e3nn: bool = False,
     model_spacing: Optional[tuple] = None,
+    n_downsample: Optional[int] = None,
+    model_scale: Optional[float] = None,
+    min_patches: int = 8,
+    per_patch_rms: bool = False,
+    logit_avg: bool = False,
 ) -> np.ndarray:
     """Batched sliding window inference with Gaussian weighting.
 
@@ -159,20 +378,42 @@ def sliding_window_inference(
     model = model.to(device).eval()
 
     img_shape = image.shape[1:]  # (D, H, W)
-    patch_voxels = _mm_to_voxels(patch_size_mm, spacing, img_shape)
+    patch_voxels = _mm_to_voxels(
+        patch_size_mm, spacing, img_shape,
+        n_downsample=n_downsample, model_scale=model_scale,
+    )
     pd, ph, pw = patch_voxels
     D, H, W = img_shape
 
-    # Compute step sizes and padding for regular grid
-    step_d = max(1, int(pd * (1 - overlap)))
-    step_h = max(1, int(ph * (1 - overlap)))
-    step_w = max(1, int(pw * (1 - overlap)))
+    # Patch positions: overlap is treated as a *minimum*; patches are
+    # distributed evenly within each dimension so no padding is needed
+    # when the volume is at least the patch size.
+    max_step_d = max(1, int(pd * (1 - overlap)))
+    max_step_h = max(1, int(ph * (1 - overlap)))
+    max_step_w = max(1, int(pw * (1 - overlap)))
 
-    total_pad_d = _compute_padding(D, pd, step_d)
-    total_pad_h = _compute_padding(H, ph, step_h)
-    total_pad_w = _compute_padding(W, pw, step_w)
+    # Distribute min_patches across axes: start with overlap-derived
+    # counts, then bump the axis with fewest positions until the product
+    # reaches min_patches.
+    dims = [(D, pd, max_step_d), (H, ph, max_step_h), (W, pw, max_step_w)]
+    per_axis_min = [1, 1, 1]
+    for i, (dim, patch, step) in enumerate(dims):
+        if dim <= patch:
+            per_axis_min[i] = 1
+        else:
+            n_steps = (dim - patch + step - 1) // step
+            per_axis_min[i] = n_steps + 1
 
-    # Symmetric reflect-pad
+    while per_axis_min[0] * per_axis_min[1] * per_axis_min[2] < min_patches:
+        # Bump the axis with fewest positions (ties broken by index)
+        bump = min(range(3), key=lambda i: per_axis_min[i])
+        per_axis_min[bump] += 1
+
+    d_positions, total_pad_d = _patch_starts(D, pd, max_step_d, min_patches=per_axis_min[0])
+    h_positions, total_pad_h = _patch_starts(H, ph, max_step_h, min_patches=per_axis_min[1])
+    w_positions, total_pad_w = _patch_starts(W, pw, max_step_w, min_patches=per_axis_min[2])
+
+    # Pad only the dimensions where the volume is smaller than the patch.
     pad_d0, pad_d1 = total_pad_d // 2, total_pad_d - total_pad_d // 2
     pad_h0, pad_h1 = total_pad_h // 2, total_pad_h - total_pad_h // 2
     pad_w0, pad_w1 = total_pad_w // 2, total_pad_w - total_pad_w // 2
@@ -182,15 +423,13 @@ def sliding_window_inference(
         image_tensor = F.pad(
             image_tensor.unsqueeze(0),
             (pad_w0, pad_w1, pad_h0, pad_h1, pad_d0, pad_d1),
-            mode='reflect',
+            mode='constant', value=0,
         ).squeeze(0)
 
+    # Patch positions returned by _patch_starts are relative to the original
+    # volume. When dim <= patch the padded volume is exactly the patch size
+    # so the [0] start covers it exactly; no re-anchoring needed.
     Dp, Hp, Wp = image_tensor.shape[1:]
-
-    # Regular grid patch positions (no boundary snapping)
-    d_positions = list(range(0, Dp - pd + 1, step_d))
-    h_positions = list(range(0, Hp - ph + 1, step_h))
-    w_positions = list(range(0, Wp - pw + 1, step_w))
 
     patch_locs = [(d, h, w)
                   for d in d_positions for h in h_positions for w in w_positions]
@@ -221,7 +460,12 @@ def sliding_window_inference(
             out = model(batch, _spacing) if _spacing is not None else model(batch)
         if isinstance(out, (list, tuple)):
             out = out[-1]
-        return F.softmax(out.float(), dim=1)
+        out = out.float()
+        # logit_avg: accumulate raw logits across overlapping patches and
+        # apply softmax once at the end (matches nnUNet predict_3D when the
+        # model's final_nonlin is Identity).  Default: per-patch softmax,
+        # then average probs.
+        return out if logit_avg else F.softmax(out, dim=1)
 
     print(f"Processing {n_patches} patches (patch_voxels={patch_voxels}, "
           f"sw_batch_size={sw_batch_size}, tta={n_combos}x)...")
@@ -235,6 +479,11 @@ def sliding_window_inference(
                 image_tensor[:, d:d+pd, h:h+ph, w:w+pw]
                 for d, h, w in batch_locs
             ]).to(device)
+            # Per-patch RMS normalization (Diaz-style)
+            if per_patch_rms:
+                rms = patches.float().pow(2).mean(dim=(1, 2, 3, 4),
+                                                  keepdim=True).sqrt()
+                patches = patches / rms.clamp(min=1e-8)
 
             # TTA: average predictions over flip combos
             pred_sum = None
@@ -259,6 +508,9 @@ def sliding_window_inference(
 
     # Normalize and crop back to original size
     output = output / weight_sum.clamp(min=1e-8)
+    if logit_avg:
+        # Convert averaged logits to probabilities once at the end
+        output = F.softmax(output, dim=1)
     output = output[:, :, pad_d0:pad_d0+D, pad_h0:pad_h0+H, pad_w0:pad_w0+W]
     return output[0].cpu().numpy()  # (C, D, H, W)
 
@@ -1120,13 +1372,21 @@ def predict_nifti(
     cropped = ras_data_4d[(slice(None),) + slices]
     print(f"  Cropped shape: {cropped.shape[1:]}")
 
-    # Z-score normalize (foreground mask only, matching training preprocessing)
-    fg_mask = cropped[0] != 0
-    fg_values = cropped[0][fg_mask]
+    # Z-score normalize using the same mask preprocess.py uses:
+    # ``binary_fill_holes(image != 0)``.  nnUNet's preprocess marks
+    # background voxels outside the nonzero bbox as seg_for_norm = -1,
+    # which leaves `seg_for_norm >= 0` equivalent to the filled nonzero
+    # mask (plus any label > 0 voxels, which always sit inside the fill).
+    # Using just `image != 0` here would miss ~0.05% of voxels per case
+    # in the filled-in "holes" of the tissue mask and produce slightly
+    # different stats than training saw — resulting in sub-percent Dice
+    # drift that mostly cancels but is non-zero on some cases.
+    nonzero_mask_crop = binary_fill_holes(cropped[0] != 0)
+    fg_values = cropped[0][nonzero_mask_crop]
     mean_val = float(fg_values.mean())
     std_val = float(fg_values.std())
     normalized = np.zeros_like(cropped)
-    normalized[0][fg_mask] = (cropped[0][fg_mask] - mean_val) / max(std_val, 1e-8)
+    normalized[0][nonzero_mask_crop] = (cropped[0][nonzero_mask_crop] - mean_val) / max(std_val, 1e-8)
 
     # Run inference (model projection handled automatically)
     reverse_transform = nib_orient.ornt_transform(ras_ornt, original_ornt)

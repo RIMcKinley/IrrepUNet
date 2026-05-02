@@ -19,9 +19,8 @@ from batchgenerators.transforms.utility_transforms import NumpyToTensor
 from .spacing import (
     SPACING_GRID, round_to_grid, round_spacing_to_tolerance,
     group_cases_by_spacing, get_canonical_permutation, apply_axis_permutation,
-    resolve_root_parent,
 )
-from .batchgen_dataset import E3nnDataset, E3nnDataLoader, SuperResDataLoader
+from .batchgen_dataset import E3nnDataset, E3nnDataLoader
 
 
 def estimate_memory_mb(
@@ -143,44 +142,77 @@ def estimate_batch_size(
 def discover_skip_files(
     preprocessed_dir: Path,
     case_ids: List[str],
-    subsample_weight: float
+    subsample_weight: float,
+    decimation_max_thickness: float = 0.0,
+    decimation_max_inplane: float = 4.0,
+    decimation_inplane_ratio_limit: float = 1.1,
 ) -> Tuple[Dict[str, dict], List[str]]:
-    """Discover skip-downsampled preprocessed files.
+    """Discover subsampled variants (in-memory synthetic + pre-computed upxy).
+
+    Skip-axis and in-plane decimated variants are no longer read from disk —
+    they are enumerated synthetically and applied via ``np.take`` at load
+    time.  ``_upxy_*`` variants remain on disk (cubic zoom is too slow to do
+    per-batch) and are treated as base sources for decimation enumeration.
 
     Args:
         preprocessed_dir: Path to preprocessed data directory
         case_ids: List of original case IDs
-        subsample_weight: Only discover if > 0
+        subsample_weight: Skip synthetic decimation when 0; upxy is always loaded.
+        decimation_max_thickness: Cap slice thickness; 0 → auto from base sources.
+        decimation_max_inplane: Cap in-plane spacing (mm).
+        decimation_inplane_ratio_limit: In-plane / slice thickness cap.
 
     Returns:
         Tuple of:
-        - properties: Dict mapping case_id (including skip variants) to metadata
-        - subsampled_cases: List of skip variant case IDs
+        - properties: Dict mapping case_id (+ synthetic variants) to metadata
+        - subsampled_cases: List of subsampled variant case IDs (synthetic + upxy)
     """
-    properties = {}
-    subsampled_cases = []
+    # Import here to avoid circular imports at module load time.
+    from .decimation import enumerate_decimation_variants
 
-    if subsample_weight == 0:
-        return properties, subsampled_cases
+    properties: Dict[str, dict] = {}
+    subsampled_cases: List[str] = []
+    base_sources: List[str] = []
 
-    # Load properties for original cases
     for case_id in case_ids:
         pkl_path = preprocessed_dir / f"{case_id}.pkl"
         if pkl_path.exists():
             with open(pkl_path, 'rb') as f:
                 properties[case_id] = pickle.load(f)
+            base_sources.append(case_id)
+        for upxy_pkl in preprocessed_dir.glob(f"{case_id}_upxy_*.pkl"):
+            sub_name = upxy_pkl.stem
+            with open(upxy_pkl, 'rb') as f:
+                up_props = pickle.load(f)
+            if up_props.get('is_subsampled', False):
+                properties[sub_name] = up_props
+                base_sources.append(sub_name)
 
-    # Discover skip variants
-    for case_id in case_ids:
-        for pkl_path in preprocessed_dir.glob(f"{case_id}_skip*.pkl"):
-            sub_case_name = pkl_path.stem
-            with open(pkl_path, 'rb') as f:
-                sub_props = pickle.load(f)
+    if subsample_weight == 0 or not base_sources:
+        # Still return upxy variants as subsampled (always-on) if present.
+        for b in base_sources:
+            if b not in case_ids:
+                subsampled_cases.append(b)
+        return properties, subsampled_cases
 
-            # Verify it's a subsampled version
-            if sub_props.get('is_subsampled', False):
-                properties[sub_case_name] = sub_props
-                subsampled_cases.append(sub_case_name)
+    max_thickness = decimation_max_thickness
+    if max_thickness <= 0:
+        max_thickness = max(max(properties[b]['spacing']) for b in base_sources)
+
+    case_id_set = set(case_ids)
+    for base_id in base_sources:
+        variants = enumerate_decimation_variants(
+            base_id,
+            properties[base_id],
+            max_thickness=max_thickness,
+            max_inplane=decimation_max_inplane,
+            inplane_ratio_limit=decimation_inplane_ratio_limit,
+        )
+        for syn_id, syn_props in variants.items():
+            properties[syn_id] = syn_props
+            subsampled_cases.append(syn_id)
+        if base_id not in case_id_set:
+            subsampled_cases.append(base_id)
 
     return properties, subsampled_cases
 
@@ -212,6 +244,11 @@ def compute_steps_through_pooling(spacing, n_downsample, model_scale=2.0):
 def adjust_for_divisibility_per_dim(voxels, factors, min_size=8):
     """Adjust voxels to be divisible by per-dimension pooling factors.
 
+    Rounds to the *nearest* multiple of the pool factor (preferring the
+    larger multiple at midpoints) rather than always flooring.  Flooring
+    can lose up to one pool-factor of coverage per axis (e.g. 170 → 128
+    at factor 64, a 25% reduction in effective patch size).
+
     Parameters
     ----------
     voxels : tuple
@@ -231,7 +268,7 @@ def adjust_for_divisibility_per_dim(voxels, factors, min_size=8):
         if f > 1:
             v_int = int(v)
             f_int = int(f)
-            v_adj = max(f_int, (v_int // f_int) * f_int)
+            v_adj = max(f_int, ((v_int + f_int // 2) // f_int) * f_int)
         else:
             v_adj = max(min_size, int(round(v)))
         adjusted.append(v_adj)
@@ -408,10 +445,13 @@ class MultiResolutionLoader:
         min_slice_thickness: float = 0.0,
         max_slice_thickness: float = 0.0,
         min_loader_cases: int = 2,
-        superres_training: bool = False,
-        superres_weight: float = 0.1,
-        group_balance: float = 0.0,
+        sampling_temperature: float = 1.0,
+        mixed_group_real_floor: float = 0.25,
         planned_batch_sizes: Optional[Dict[tuple, int]] = None,
+        decimation_max_thickness: float = 0.0,
+        decimation_max_inplane: float = 4.0,
+        decimation_inplane_ratio_limit: float = 1.1,
+        dual_assign_ambiguous: bool = False,
     ):
         self.preprocessed_dir = Path(preprocessed_dir)
         self.batch_size = batch_size
@@ -427,29 +467,20 @@ class MultiResolutionLoader:
         self.fp16 = fp16
         self.subsample_weight = subsample_weight
         self.model_scale = model_scale
-        self.superres_training = superres_training
-        self.superres_weight = superres_weight
+        self.mixed_group_real_floor = mixed_group_real_floor
         self.planned_batch_sizes = planned_batch_sizes or {}
 
-        # Load properties to get spacings
-        properties = {}
-        for case_name in case_identifiers:
-            pkl_path = self.preprocessed_dir / f"{case_name}.pkl"
-            if pkl_path.exists():
-                with open(pkl_path, 'rb') as f:
-                    properties[case_name] = pickle.load(f)
-
-        # Discover preprocessed subsampled cases if subsample_weight > 0
-        subsampled_cases = []
-        if subsample_weight > 0:
-            for case_name in case_identifiers:
-                for pkl_path in self.preprocessed_dir.glob(f"{case_name}_skip*.pkl"):
-                    sub_case_name = pkl_path.stem
-                    with open(pkl_path, 'rb') as f:
-                        sub_props = pickle.load(f)
-                    if sub_props.get('is_subsampled', False):
-                        properties[sub_case_name] = sub_props
-                        subsampled_cases.append(sub_case_name)
+        # On-the-fly decimation: skip-subsampled variants are enumerated in
+        # memory; upxy variants stay on disk.  See discover_skip_files for
+        # details.
+        properties, subsampled_cases = discover_skip_files(
+            self.preprocessed_dir,
+            case_identifiers,
+            subsample_weight,
+            decimation_max_thickness=decimation_max_thickness,
+            decimation_max_inplane=decimation_max_inplane,
+            decimation_inplane_ratio_limit=decimation_inplane_ratio_limit,
+        )
 
         # Group cases by spacing (with optional spacing filters)
         self.min_spacing = min_spacing
@@ -458,7 +489,8 @@ class MultiResolutionLoader:
         self.max_slice_thickness = max_slice_thickness
         self.spacing_groups = group_cases_by_spacing(
             properties, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-            min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+            min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+            dual_assign_ambiguous=dual_assign_ambiguous)
 
         # Track which cases are subsampled (for weight calculation)
         self.subsampled_cases = set(subsampled_cases)
@@ -517,36 +549,25 @@ class MultiResolutionLoader:
                 spacing_str = tuple(f"{s:.3f}" for s in spacing)
                 print(f"    {spacing_str}: {reason}")
 
-        # Create super-resolution subloaders if enabled
-        self.superres_loaders: Dict[tuple, SingleThreadedAugmenter] = {}
-        if superres_training and subsampled_cases:
-            self._create_superres_loaders(
-                preprocessed_dir, subsampled_cases, properties,
-                oversample_foreground_percent, superres_weight,
-                n_total_cases=len(case_identifiers),
-            )
-
         # Normalize weights
         total_weight = sum(w for _, w in self.group_weights)
         self.group_weights = [(s, w / total_weight) for s, w in self.group_weights]
 
-        # Apply group balancing: blend proportional with uniform
-        # balance=0: proportional to case count, balance=1: uniform across groups
-        if group_balance > 0 and len(self.group_weights) > 1:
-            uniform = 1.0 / len(self.group_weights)
-            self.group_weights = [
-                (s, (1 - group_balance) * w + group_balance * uniform)
-                for s, w in self.group_weights
-            ]
-            print(f"  Group balancing: {group_balance:.2f} (0=proportional, 1=uniform)")
+        # Apply sampling temperature: w <- w^t, renormalize.
+        # t=1 is proportional (no-op), t<1 flattens toward uniform, t=0 is exactly uniform.
+        if sampling_temperature != 1.0 and len(self.group_weights) > 1:
+            t = max(sampling_temperature, 0.0)
+            tempered = [w ** t for _, w in self.group_weights]
+            total = sum(tempered)
+            if total > 0:
+                self.group_weights = [
+                    (s, r / total) for (s, _), r in zip(self.group_weights, tempered)
+                ]
+            print(f"  Sampling temperature: {sampling_temperature:.2f} "
+                  f"(1.0=proportional, 0.0=uniform)")
 
         # Initialize iterators
         for spacing, loader in self.group_loaders.items():
-            try:
-                next(loader)
-            except:
-                pass
-        for key, loader in self.superres_loaders.items():
             try:
                 next(loader)
             except:
@@ -624,6 +645,26 @@ class MultiResolutionLoader:
             probabilistic_oversampling=True,
         )
 
+        # Per-case sampling probabilities inside mixed groups.
+        # Default batchgenerators behaviour is uniform across cases, so a
+        # mixed group with lots of subsampled variants will sample
+        # subsampled cases at their raw proportion — which can bury the
+        # originals.  Enforce a floor on the real-cohort share within
+        # mixed groups only; pure-orig and pure-sub groups stay uniform.
+        floor = self.mixed_group_real_floor
+        if floor > 0 and cases:
+            orig_mask = np.array([c not in self.subsampled_cases for c in dataloader.indices])
+            n_orig = int(orig_mask.sum())
+            n_sub = len(orig_mask) - n_orig
+            if n_orig > 0 and n_sub > 0:
+                natural_real_share = n_orig / (n_orig + n_sub)
+                real_share = max(floor, natural_real_share)
+                if real_share > natural_real_share + 1e-12:
+                    probs = np.where(orig_mask,
+                                     real_share / n_orig,
+                                     (1 - real_share) / n_sub)
+                    dataloader.sampling_probabilities = probs
+
         if num_workers > 0 and transforms is not None:
             augmenter = MultiThreadedAugmenter(
                 dataloader, transforms,
@@ -666,63 +707,6 @@ class MultiResolutionLoader:
 
         print(f"    Spacing {spacing_str}: {len(cases)} cases, patch={patch_size}, batch={batch_size}, weight={weight:.3f} ({group_type})")
 
-    def _create_superres_loaders(
-        self,
-        preprocessed_dir: str,
-        subsampled_cases: List[str],
-        properties: Dict[str, dict],
-        oversample_foreground_percent: float,
-        superres_weight: float,
-        n_total_cases: int,
-    ):
-        """Create super-resolution subloaders for subsampled cases."""
-        sr_groups: Dict[tuple, List[str]] = defaultdict(list)
-        for sub_id in subsampled_cases:
-            if sub_id not in properties:
-                continue
-            root_id = resolve_root_parent(sub_id, properties)
-            if root_id not in properties:
-                continue
-
-            sub_sp = properties[sub_id]['spacing']
-            orig_sp = properties[root_id]['spacing']
-            sub_canonical = tuple(sorted(sub_sp))
-            orig_canonical = tuple(sorted(orig_sp))
-            sub_rounded = round_spacing_to_tolerance(sub_canonical)
-            orig_rounded = round_spacing_to_tolerance(orig_canonical)
-            key = ('superres', sub_rounded, orig_rounded)
-            sr_groups[key].append(sub_id)
-
-        if not sr_groups:
-            return
-
-        print(f"\n  Super-resolution subloaders:")
-        n_sr_groups = len(sr_groups)
-        weight_per_group = superres_weight / n_sr_groups if n_sr_groups > 0 else 0
-
-        for key, sub_ids in sorted(sr_groups.items()):
-            _, sub_sp, orig_sp = key
-            patch_size_voxels = self._mm_to_voxels(self.patch_size_mm, sub_sp)
-
-            sr_loader = SuperResDataLoader(
-                preprocessed_dir=self.preprocessed_dir,
-                sub_case_ids=sub_ids,
-                properties=properties,
-                patch_size=patch_size_voxels,
-                oversample_foreground_percent=oversample_foreground_percent,
-            )
-
-            sr_transforms = Compose([NumpyToTensor(keys=['data', 'seg'], cast_to='float')])
-            augmenter = SingleThreadedAugmenter(sr_loader, sr_transforms)
-            self.superres_loaders[key] = augmenter
-
-            self.group_weights.append((key, weight_per_group))
-
-            sub_sp_str = tuple(f"{s:.2f}" for s in sub_sp)
-            orig_sp_str = tuple(f"{s:.2f}" for s in orig_sp)
-            print(f"    {sub_sp_str} -> {orig_sp_str}: {len(sub_ids)} cases, "
-                  f"patch={patch_size_voxels}, batch=1, weight={weight_per_group:.3f}")
-
     def set_active_groups(self, predicate=None):
         """Restrict sampling to groups matching *predicate*.
 
@@ -744,17 +728,12 @@ class MultiResolutionLoader:
             self.group_weights = list(self._all_group_weights)
         else:
             active = [(s, w) for s, w in self._all_group_weights
-                      if isinstance(s, tuple) and len(s) == 3
-                      and s[0] != 'superres' and predicate(s)]
-            # Keep superres entries as-is if present
-            superres = [(s, w) for s, w in self._all_group_weights
-                        if isinstance(s, tuple) and len(s) == 3
-                        and s[0] == 'superres']
+                      if isinstance(s, tuple) and len(s) == 3 and predicate(s)]
             if not active:
                 # Fallback: keep all groups to avoid empty loader
                 self.group_weights = list(self._all_group_weights)
                 return
-            self.group_weights = active + superres
+            self.group_weights = active
 
         total = sum(w for _, w in self.group_weights)
         if total > 0:
@@ -769,15 +748,6 @@ class MultiResolutionLoader:
         weights = [w for _, w in self.group_weights]
         group_spacing = spacings[np.random.choice(len(spacings), p=weights)]
 
-        # Check if this is a super-res group
-        if isinstance(group_spacing, tuple) and len(group_spacing) == 3 and group_spacing[0] == 'superres':
-            batch = next(self.superres_loaders[group_spacing])
-            if 'spacings' in batch and len(batch['spacings']) > 0:
-                selected_spacing = tuple(batch['spacings'][0])
-            else:
-                selected_spacing = group_spacing[1]
-            return batch, selected_spacing
-
         batch = next(self.group_loaders[group_spacing])
 
         if 'spacings' in batch and len(batch['spacings']) > 0:
@@ -787,7 +757,6 @@ class MultiResolutionLoader:
         else:
             selected_spacing = group_spacing
 
-        # Store canonical group spacing for spatial_splits lookup
         batch['group_spacing'] = group_spacing
 
         return batch, selected_spacing
@@ -810,8 +779,6 @@ class MultiResolutionLoader:
 
         groups = []
         for spacing, weight in self.group_weights:
-            if isinstance(spacing, tuple) and len(spacing) == 3 and spacing[0] == 'superres':
-                continue
             patch_voxels = self.group_patch_sizes.get(spacing, ())
             batch_size = self.group_batch_sizes.get(spacing, self.batch_size)
             est_mem = estimate_memory_mb(
@@ -829,35 +796,10 @@ class MultiResolutionLoader:
             else:
                 group_type = 'real'
 
-            # Compute spatial splits needed if batch_size=1 exceeds memory
-            n_spatial_splits = 1
-            if batch_size == 1 and self.target_memory_mb > 0:
-                mem_for_1 = estimate_memory_mb(
-                    patch_voxels, self.n_base_filters,
-                    batch_size=1, n_downsample=self.n_downsample,
-                    fp16=self.fp16, spacing=spacing,
-                )
-                if mem_for_1 > self.target_memory_mb:
-                    import math
-                    test_patch = list(patch_voxels)
-                    while mem_for_1 > self.target_memory_mb and n_spatial_splits <= 16:
-                        n_spatial_splits *= 2
-                        max_dim_idx = test_patch.index(max(test_patch))
-                        test_patch[max_dim_idx] = max(
-                            self.pooling_factor, test_patch[max_dim_idx] // 2
-                        )
-                        mem_for_1 = estimate_memory_mb(
-                            tuple(test_patch), self.n_base_filters,
-                            batch_size=1, n_downsample=self.n_downsample,
-                            fp16=self.fp16, spacing=spacing,
-                        )
-                    est_mem = mem_for_1  # Show per-split memory
-
             groups.append({
                 'spacing': spacing,
                 'patch_size_voxels': patch_voxels,
                 'batch_size': batch_size,
-                'n_spatial_splits': n_spatial_splits,
                 'estimated_memory_mb': round(est_mem, 1),
                 'n_cases': len(cases),
                 'group_type': group_type,

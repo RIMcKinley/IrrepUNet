@@ -32,10 +32,15 @@ import torch
 
 from irrepunet.data.multi_resolution_loader import estimate_batch_size
 from irrepunet.inference import sliding_window_inference as _sw_inference
+from irrepunet.inference import (
+    spacing_ensemble_members,
+    snap_to_arch_canonical as _sw_snap_to_arch_canonical,
+)
 from irrepunet.models import (
     project_to_spacing,
     architecture_spacing_range,
     update_projected_weights,
+    jitter_projected_kernels,
 )
 from irrepunet.models.unet import E3nnUNet
 
@@ -47,7 +52,8 @@ from irrepunet.models.unet import E3nnUNet
 
 def run_inference(image, model, spacing, patch_mm, overlap,
                   device_str, mirror_axes, sw_batch_size,
-                  native_e3nn=False):
+                  native_e3nn=False,
+                  n_downsample=None, model_scale=None):
     """Run sliding_window_inference from irrepunet.inference on preprocessed data.
 
     Uses the same reflect-padding, Gaussian weighting, and batched patch
@@ -90,6 +96,8 @@ def run_inference(image, model, spacing, patch_mm, overlap,
         mirror_axes=mirror_axes,
         sw_batch_size=sw_batch_size,
         native_e3nn=native_e3nn,
+        n_downsample=n_downsample,
+        model_scale=model_scale,
     )
 
 
@@ -102,6 +110,66 @@ def dice_score(pred, target):
     if union == 0:
         return 1.0 if tgt_fg.sum() == 0 else 0.0
     return (2.0 * intersection) / union
+
+
+snap_to_arch_canonical = _sw_snap_to_arch_canonical
+
+
+def _jitter_draws(sigma, n):
+    """Build a list of per-axis scale factors for spacing-jitter TTA.
+
+    Small-N schemes are deterministic and symmetric around 1.0 so the
+    first few draws are reproducible and well-structured:
+
+    * n = 1 — single random draw from N(1, sigma) per axis (keeps the
+      "one perturbed prediction" semantic).
+    * n = 2 — isotropic plus/minus: ``[(1-σ)³, (1+σ)³]``.
+    * n = 3 — isotropic with baseline: ``[(1-σ)³, 1³, (1+σ)³]``.
+    * n = 5 — five-point symmetric: ``[(1-2σ)³, (1-σ)³, 1³, (1+σ)³, (1+2σ)³]``.
+    * other n (4, 6, 7, ...) — n random draws from N(1, sigma) per axis.
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        rng = np.random.default_rng()
+        s = rng.normal(1.0, sigma, size=3)
+        return [tuple(float(x) for x in s)]
+    if n == 2:
+        return [(1.0 - sigma,) * 3, (1.0 + sigma,) * 3]
+    if n == 3:
+        return [(1.0 - sigma,) * 3, (1.0, 1.0, 1.0), (1.0 + sigma,) * 3]
+    if n == 5:
+        return [
+            (1.0 - 2 * sigma,) * 3,
+            (1.0 - sigma,) * 3,
+            (1.0, 1.0, 1.0),
+            (1.0 + sigma,) * 3,
+            (1.0 + 2 * sigma,) * 3,
+        ]
+    rng = np.random.default_rng()
+    return [tuple(float(x) for x in rng.normal(1.0, sigma, size=3))
+            for _ in range(n)]
+
+
+def _restrict_jitter_to_inplane(draws, spacing, thick_threshold=1.5):
+    """Zero-out jitter on axes whose spacing exceeds ``thick_threshold``.
+
+    The kernel at a thick-slice axis already samples only a couple of
+    voxels, so perturbing the physical scale there just moves the kernel
+    outside the RBF support rather than producing a useful alternate
+    view.  Limiting jitter to the in-plane (fine) axes keeps TTA aligned
+    with the axes that actually benefit.
+
+    Returns draws unchanged when no axis exceeds the threshold (i.e.
+    thin-slice / near-isotropic cases).
+    """
+    thick_axes = [i for i, s in enumerate(spacing) if s >= thick_threshold]
+    if not thick_axes:
+        return draws
+    adjusted = []
+    for d in draws:
+        adjusted.append(tuple(1.0 if i in thick_axes else d[i] for i in range(3)))
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +226,13 @@ def load_model(experiment_dir, checkpoint_name, device):
 
     with open(config_path) as f:
         config = json.load(f)
+
+    # Apply spacing_grid override if this experiment was planned with one.
+    grid_override = config.get('augmentation', {}).get('spacing_grid')
+    if grid_override:
+        from irrepunet.data import spacing as _spacing_mod
+        _spacing_mod.set_spacing_grid(grid_override)
+        print(f"Applied SPACING_GRID from config: {list(_spacing_mod.SPACING_GRID)}")
 
     print(f"Loading checkpoint: {checkpoint_path}")
     model, checkpoint = E3nnUNet.load_checkpoint(checkpoint_path, device=device)
@@ -371,6 +446,14 @@ def run_validation(
     no_train_counts=False,
     mirror_tta=False,
     native_e3nn=False,
+    patch_size_mm=None,
+    use_group_spacing=False,
+    spacing_ensemble=False,
+    snap_arch=False,
+    spacing_jitter=0.0,
+    spacing_jitter_tta=1,
+    cases_key='val',
+    preprocessed_dir_override=None,
 ):
     """Run full-volume validation on all validation cases.
 
@@ -414,10 +497,22 @@ def run_validation(
     if output is None:
         stem = Path(checkpoint).stem
         suffixes = []
+        if cases_key != 'val':
+            suffixes.append(cases_key)
         if native_e3nn:
             suffixes.append('native')
         if mirror_tta:
             suffixes.append('mirror')
+        if use_group_spacing:
+            suffixes.append('groupsp')
+        if spacing_ensemble:
+            suffixes.append('spens')
+        if snap_arch:
+            suffixes.append('snaparch')
+        if spacing_jitter > 0:
+            suffixes.append(f'jit{int(round(spacing_jitter*100)):02d}x{spacing_jitter_tta}')
+        if patch_size_mm is not None:
+            suffixes.append('patch' + 'x'.join(f'{int(p)}' for p in patch_size_mm))
         tta_suffix = '_' + '_'.join(suffixes) if suffixes else ''
         output = f'val_{stem}{tta_suffix}.json'
 
@@ -435,26 +530,48 @@ def run_validation(
 
     # Support both flat and nested config formats
     data_config = config.get('data', config)
-    preprocessed_dir = Path(data_config['preprocessed_dir'])
+    if preprocessed_dir_override is not None:
+        preprocessed_dir = Path(preprocessed_dir_override)
+        print(f'preprocessed_dir override: {preprocessed_dir}')
+    else:
+        preprocessed_dir = Path(data_config['preprocessed_dir'])
     fold = data_config.get('fold', 0)
 
-    # Use val_cases from config if available, else load from splits
-    if 'val_cases' in data_config:
+    # Use val_cases from config if available, else load from splits.
+    # When cases_key is overridden (e.g. 'heldout'), always read from splits.
+    if cases_key == 'val' and 'val_cases' in data_config:
         val_cases = data_config['val_cases']
     else:
         with open(preprocessed_dir / 'splits_final.json') as f:
             splits = json.load(f)
-        val_cases = splits[fold]['val']
+        if cases_key not in splits[fold]:
+            raise KeyError(
+                f'splits_final.json fold {fold} has no "{cases_key}" key '
+                f'(found: {list(splits[fold].keys())})'
+            )
+        val_cases = splits[fold][cases_key]
+        print(f'Using "{cases_key}" cases from splits_final.json fold {fold}: '
+              f'{len(val_cases)} cases')
 
     training_config = config.get('training', config)
-    patch_mm = training_config.get('patch_size_mm', [80, 80, 80])
-    if isinstance(patch_mm, list):
-        patch_mm = patch_mm[0]
+    if patch_size_mm is not None:
+        # CLI override — keep as a tuple (may be anisotropic)
+        patch_mm = tuple(float(p) for p in patch_size_mm)
+        print(f"Patch size mm override: {patch_mm}")
+    else:
+        patch_mm = training_config.get('patch_size_mm', [80, 80, 80])
+        if isinstance(patch_mm, list):
+            # Use full tuple if anisotropic, scalar if all equal
+            if len(set(patch_mm)) == 1:
+                patch_mm = patch_mm[0]
+            else:
+                patch_mm = tuple(float(p) for p in patch_mm)
 
     # Model params for dynamic sw_batch_size estimation
     model_config = config.get('model', config)
     n_base_filters = model_config.get('n_base_filters', 2)
     n_downsample = model_config.get('n_downsample', 4)
+    model_scale = float(model_config.get('scale', 2.0))
     gpu_mem_mb = torch.cuda.get_device_properties(gpu).total_memory / 1024**2
     target_memory_mb = gpu_mem_mb * 0.9
 
@@ -479,6 +596,56 @@ def run_validation(
         case: tuple(float(s) for s in props['spacing'])
         for case, props in case_props.items()
     }
+
+    # Store raw spacings for spacing_ensemble (needs original values to
+    # detect off-grid cases).  use_group_spacing snaps close-to-grid cases;
+    # spacing_ensemble subsumes this by snapping close cases AND ensembling
+    # far ones.
+    raw_case_spacings = dict(case_spacings)
+
+    if use_group_spacing and not spacing_ensemble:
+        from irrepunet.data.spacing import round_spacing_to_tolerance
+        if snap_arch:
+            new_case_spacings = {}
+            n_arch_override = 0
+            for case, sp in case_spacings.items():
+                snapped = snap_to_arch_canonical(model, sp)
+                distance_snap = tuple(round_spacing_to_tolerance(sp))
+                if snapped != distance_snap:
+                    n_arch_override += 1
+                new_case_spacings[case] = snapped
+            case_spacings = new_case_spacings
+            print(f"Using arch-matched canonical snap "
+                  f"({n_arch_override}/{len(case_spacings)} cases differ from distance-nearest)")
+        else:
+            case_spacings = {
+                case: round_spacing_to_tolerance(sp)
+                for case, sp in case_spacings.items()
+            }
+            print(f"Using canonical group spacing (rounded to grid)")
+    elif spacing_ensemble:
+        # Snap close-to-grid cases to canonical, keep far ones at native
+        # for ensemble. spacing_ensemble_members handles both.  When
+        # --snap_arch is set, pass the model so the arch-matched canonical
+        # is added as an extra ensemble member (when it differs from the
+        # distance-nearest canonical).
+        from irrepunet.data.spacing import round_spacing_to_tolerance
+        ens_model = model if snap_arch else None
+        case_spacings = {}
+        for case, sp in raw_case_spacings.items():
+            members = spacing_ensemble_members(sp, model=ens_model)
+            if len(members) == 1:
+                # Close to grid — use canonical
+                case_spacings[case] = members[0]
+            else:
+                # Far from grid — keep native (ensemble will handle)
+                case_spacings[case] = sp
+        n_ens = sum(1 for c in case_spacings
+                    if len(spacing_ensemble_members(raw_case_spacings[c],
+                                                    model=ens_model)) > 1)
+        suffix = " with arch-snap member" if snap_arch else ""
+        print(f"Spacing ensemble{suffix}: {n_ens} cases will be ensembled, "
+              f"{len(case_spacings) - n_ens} at canonical")
 
     # Native e3nn mode: prepare model once
     if native_e3nn:
@@ -519,7 +686,293 @@ def run_validation(
     projection_times = {}
     gpu_rep = None  # which rep is currently on GPU
 
-    for i, case in enumerate(val_cases_sorted):
+    # --- Spacing ensemble: projection-first loop ---
+    # Pre-compute ensemble plan and accumulate partial probs per case,
+    # iterating over unique projections in the outer loop so each model
+    # is loaded exactly once.
+    if spacing_ensemble and not native_e3nn:
+        from collections import defaultdict
+
+        # Build ensemble plan: case → list of projection spacings
+        ens_model = model if snap_arch else None
+        case_members = {}
+        all_proj_spacings = set()
+        for case in val_cases_sorted:
+            members = spacing_ensemble_members(case_spacings[case], model=ens_model)
+            members = [tuple(float(s) for s in m) for m in members]
+            case_members[case] = members
+            all_proj_spacings.update(members)
+
+        # Map projection spacing → list of cases needing it
+        proj_to_cases = defaultdict(list)
+        for case, members in case_members.items():
+            for sp in members:
+                proj_to_cases[sp].append(case)
+
+        # Sort projections by number of cases (most-used first)
+        sorted_projs = sorted(all_proj_spacings,
+                              key=lambda sp: -len(proj_to_cases[sp]))
+
+        print(f"Spacing ensemble: {len(sorted_projs)} unique projections "
+              f"for {sum(len(m) > 1 for m in case_members.values())} ensemble cases")
+
+        # Accumulators: probs_accum[case] = (sum_probs, n_members)
+        probs_accum = {}
+        case_times = defaultdict(float)
+
+        for pi, proj_sp in enumerate(sorted_projs):
+            cases_for_proj = proj_to_cases[proj_sp]
+            sp_str = f"({proj_sp[0]:.3f}, {proj_sp[1]:.3f}, {proj_sp[2]:.3f})"
+
+            # Project once.  In this ensemble branch every proj_sp is unique
+            # (sorted_projs is built from a set), so prior projections are
+            # never reused — drop them from the cache to free CPU memory,
+            # otherwise 150+ materialised Conv3d models accumulate across a
+            # full run.
+            try:
+                if gpu_rep is not None and gpu_rep in projected_cache:
+                    projected_cache[gpu_rep].cpu()
+                    del projected_cache[gpu_rep]
+                    torch.cuda.empty_cache()
+                    gpu_rep = None
+                tp = time.time()
+                projected = project_to_spacing(model, proj_sp)
+                projected.to(torch.device(device_str)).eval()
+                projected_cache[proj_sp] = projected
+                gpu_rep = proj_sp
+                proj_time = time.time() - tp
+                print(f"  [{pi+1}/{len(sorted_projs)}] Projected {sp_str} "
+                      f"[{proj_time:.1f}s] — {len(cases_for_proj)} cases")
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
+                    raise
+                torch.cuda.empty_cache()
+                print(f"  [{pi+1}/{len(sorted_projs)}] {sp_str}: OOM during projection — skipped")
+                continue
+
+            # Run inference on all cases needing this projection
+            for case in cases_for_proj:
+                if case in skipped:
+                    continue
+                tc = time.time()
+                img = np.load(preprocessed_dir / f"{case}.npy")
+                if isinstance(patch_mm, (tuple, list)):
+                    pv = tuple(max(1, int(round(p / s))) for p, s in zip(patch_mm, proj_sp))
+                else:
+                    pv = tuple(max(1, int(round(patch_mm / s))) for s in proj_sp)
+                case_sw_batch = estimate_batch_size(
+                    pv, n_base_filters, target_memory_mb,
+                    min_batch=1, max_batch=sw_batch_size,
+                    n_downsample=n_downsample, fp16=True, mode='infer',
+                )
+                try:
+                    p = run_inference(
+                        img, projected, proj_sp, patch_mm, overlap,
+                        device_str, mirror_axes, case_sw_batch,
+                        n_downsample=n_downsample, model_scale=model_scale)
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
+                        raise
+                    torch.cuda.empty_cache()
+                    skipped.append({'case': case, 'spacing': list(case_spacings[case]),
+                                    'shape': list(case_props[case]['shape']), 'reason': 'OOM'})
+                    continue
+
+                if case not in probs_accum:
+                    probs_accum[case] = [p.copy(), 1]
+                else:
+                    probs_accum[case][0] += p
+                    probs_accum[case][1] += 1
+                case_times[case] += time.time() - tc
+
+        # Free the last projected model before finalizing.
+        if gpu_rep is not None and gpu_rep in projected_cache:
+            projected_cache[gpu_rep].cpu()
+            del projected_cache[gpu_rep]
+            torch.cuda.empty_cache()
+            gpu_rep = None
+
+        # Finalize: average, threshold, compute dice
+        skipped_set = {s['case'] for s in skipped} if skipped else set()
+        for i, case in enumerate(val_cases_sorted):
+            if case in skipped_set or case not in probs_accum:
+                continue
+            seg = np.load(preprocessed_dir / f"{case}_seg.npy")
+            if seg.ndim == 4:
+                seg = seg[0]
+            sum_probs, n_members = probs_accum[case]
+            probs = sum_probs / n_members
+            pred_np = probs.argmax(axis=0).astype(np.int16)
+            d = dice_score(pred_np, seg)
+            elapsed = case_times[case]
+
+            if pred_dir is not None:
+                props = case_props[case]
+                nifti_path = pred_dir / f"{case}.nii.gz"
+                save_prediction_nifti(pred_np, props, nifti_path)
+
+            results.append({
+                'case': case,
+                'spacing': list(case_spacings[case]),
+                'shape': list(case_props[case]['shape']),
+                'dice': d,
+                'time': round(elapsed, 2),
+            })
+            print(f"[{len(results)}/{len(val_cases_sorted)}] {case}: dice={d:.4f}, "
+                  f"spacing=({case_spacings[case][0]:.2f},{case_spacings[case][1]:.2f},"
+                  f"{case_spacings[case][2]:.2f}), time={elapsed:.1f}s, ens={n_members}")
+
+        # Free accumulators
+        del probs_accum
+
+    # --- Jitter-TTA branch: spacing-first, draws shared across cases ---
+    # Active when spacing_jitter > 0 and distilled mode (no native_e3nn and
+    # no spacing_ensemble).  Groups cases by their exact inference spacing,
+    # projects once per spacing group, and iterates jitter draws in the
+    # outer position so each draw's kernel recomputation is amortised
+    # across every case at that spacing.
+    jitter_active = (spacing_jitter > 0.0 and not native_e3nn and not spacing_ensemble
+                     and spacing_jitter_tta >= 1)
+    if jitter_active:
+        from collections import defaultdict
+        cases_by_spacing = defaultdict(list)
+        for case in val_cases_sorted:
+            cases_by_spacing[case_spacings[case]].append(case)
+
+        draws = _jitter_draws(spacing_jitter, spacing_jitter_tta)
+        if spacing_jitter_tta == 1:
+            scheme_label = 'single random draw'
+        elif spacing_jitter_tta in (2, 3):
+            scheme_label = 'deterministic ±σ'
+        elif spacing_jitter_tta == 5:
+            scheme_label = 'deterministic ±σ, ±2σ'
+        else:
+            scheme_label = f'random (N={spacing_jitter_tta})'
+        print(f"Jitter TTA: sigma={spacing_jitter}, N={len(draws)} ({scheme_label}), "
+              f"{len(cases_by_spacing)} spacing groups")
+
+        for spi, (sp, cases_here) in enumerate(cases_by_spacing.items()):
+            rep = spacing_to_rep[sp]
+            try:
+                if rep not in projected_cache:
+                    if gpu_rep is not None and gpu_rep in projected_cache:
+                        projected_cache[gpu_rep].cpu()
+                        torch.cuda.empty_cache()
+                        gpu_rep = None
+                    tp = time.time()
+                    projected = project_to_spacing(model, rep)
+                    projected.to(torch.device(device_str)).eval()
+                    projection_times[rep] = time.time() - tp
+                    projected_cache[rep] = projected
+                    gpu_rep = rep
+                else:
+                    projected = projected_cache[rep]
+                    if gpu_rep != rep:
+                        if gpu_rep is not None and gpu_rep in projected_cache:
+                            projected_cache[gpu_rep].cpu()
+                            torch.cuda.empty_cache()
+                        projected.to(torch.device(device_str))
+                        gpu_rep = rep
+                if sp != projected._current_spacing:
+                    update_projected_weights(projected, model, sp, verify=True)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
+                    raise
+                torch.cuda.empty_cache()
+                print(f"  [{spi+1}/{len(cases_by_spacing)}] {sp}: OOM during projection — "
+                      f"skipping {len(cases_here)} cases")
+                for c in cases_here:
+                    skipped.append({'case': c, 'spacing': list(sp),
+                                    'shape': list(case_props[c]['shape']),
+                                    'reason': 'OOM_projection'})
+                continue
+
+            # Isotropic jitter across all axes; per-axis masking showed a
+            # small net regression on this model, see log.
+            effective_draws = draws
+            sp_str = f"({sp[0]:.3f}, {sp[1]:.3f}, {sp[2]:.3f})"
+            print(f"  [{spi+1}/{len(cases_by_spacing)}] {sp_str}: "
+                  f"{len(cases_here)} cases × {len(effective_draws)} draws")
+
+            probs_accum = {c: None for c in cases_here}
+            case_time = {c: 0.0 for c in cases_here}
+            case_oom = set()
+            for di, scale in enumerate(effective_draws):
+                try:
+                    jitter_projected_kernels(projected, model, scale)
+                except Exception as e:
+                    print(f"    draw {di+1} jitter_projected_kernels failed: {e}")
+                    break
+                for case in cases_here:
+                    if case in case_oom:
+                        continue
+                    tc = time.time()
+                    img = np.load(preprocessed_dir / f"{case}.npy")
+                    if isinstance(patch_mm, (tuple, list)):
+                        pv = tuple(max(1, int(round(p / s))) for p, s in zip(patch_mm, sp))
+                    else:
+                        pv = tuple(max(1, int(round(patch_mm / s))) for s in sp)
+                    case_sw_batch = estimate_batch_size(
+                        pv, n_base_filters, target_memory_mb,
+                        min_batch=1, max_batch=sw_batch_size,
+                        n_downsample=n_downsample, fp16=True, mode='infer',
+                    )
+                    try:
+                        p = run_inference(
+                            img, projected, sp, patch_mm, overlap,
+                            device_str, mirror_axes, case_sw_batch,
+                            n_downsample=n_downsample, model_scale=model_scale)
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
+                            raise
+                        torch.cuda.empty_cache()
+                        case_oom.add(case)
+                        skipped.append({'case': case, 'spacing': list(sp),
+                                        'shape': list(case_props[case]['shape']),
+                                        'reason': 'OOM'})
+                        continue
+                    probs_accum[case] = p if probs_accum[case] is None else probs_accum[case] + p
+                    case_time[case] += time.time() - tc
+
+            # Divide by actual number of draws applied to this group
+            _n_draws_used = len(effective_draws)
+
+            # Restore kernels for this projection before moving on
+            try:
+                jitter_projected_kernels(projected, model, (1.0, 1.0, 1.0))
+            except Exception:
+                pass
+
+            # Finalise dice / predictions for this spacing group
+            for case in cases_here:
+                if case in case_oom or probs_accum[case] is None:
+                    continue
+                seg = np.load(preprocessed_dir / f"{case}_seg.npy")
+                if seg.ndim == 4:
+                    seg = seg[0]
+                probs = probs_accum[case] / _n_draws_used
+                pred_np = probs.argmax(axis=0).astype(np.int16)
+                d = dice_score(pred_np, seg)
+
+                if pred_dir is not None:
+                    props = case_props[case]
+                    nifti_path = pred_dir / f"{case}.nii.gz"
+                    save_prediction_nifti(pred_np, props, nifti_path)
+
+                results.append({
+                    'case': case,
+                    'spacing': list(sp),
+                    'shape': list(case_props[case]['shape']),
+                    'dice': d,
+                    'time': round(case_time[case], 2),
+                })
+                print(f"[{len(results)}/{len(val_cases_sorted)}] {case}: dice={d:.4f}, "
+                      f"spacing=({sp[0]:.2f},{sp[1]:.2f},{sp[2]:.2f}), "
+                      f"time={case_time[case]:.1f}s, jitter_tta={len(draws)}")
+
+    # --- Standard (non-ensemble, non-jitter) inference: case-first loop ---
+    if not (spacing_ensemble and not native_e3nn) and not jitter_active:
+      for i, case in enumerate(val_cases_sorted):
         tc = time.time()
         spacing = case_spacings[case]
         rep = spacing_to_rep[spacing]
@@ -528,7 +981,6 @@ def run_validation(
             # Project or reuse (only one model on GPU at a time)
             try:
                 if rep not in projected_cache:
-                    # Evict current GPU model before projecting a new one
                     if gpu_rep is not None and gpu_rep in projected_cache:
                         projected_cache[gpu_rep].cpu()
                         torch.cuda.empty_cache()
@@ -544,7 +996,6 @@ def run_validation(
                     print(f"  Projected ({rep[0]:.3f}, {rep[1]:.3f}, {rep[2]:.3f}) [{proj_time:.1f}s]")
                 else:
                     projected = projected_cache[rep]
-                    # Move to GPU if not already there
                     if gpu_rep != rep:
                         if gpu_rep is not None and gpu_rep in projected_cache:
                             projected_cache[gpu_rep].cpu()
@@ -570,24 +1021,24 @@ def run_validation(
         if seg.ndim == 4:
             seg = seg[0]
 
-        # Dynamic sw_batch_size: estimate from patch voxels and GPU memory
-        patch_voxels = tuple(max(1, int(round(patch_mm / s))) for s in spacing)
+        if isinstance(patch_mm, (tuple, list)):
+            patch_voxels = tuple(max(1, int(round(p / s))) for p, s in zip(patch_mm, spacing))
+        else:
+            patch_voxels = tuple(max(1, int(round(patch_mm / s))) for s in spacing)
         case_sw_batch = estimate_batch_size(
             patch_voxels, n_base_filters, target_memory_mb,
             min_batch=1, max_batch=sw_batch_size,
             n_downsample=n_downsample, fp16=True, mode='infer',
         )
 
-        # Select model for inference
         inference_model = native_model if native_e3nn else projected
 
-        # Inference with OOM protection (catches both torch.cuda.OutOfMemoryError
-        # and RuntimeError from TorchScript OOM)
         try:
             probs = run_inference(
                 img, inference_model, spacing, patch_mm, overlap,
                 device_str, mirror_axes, case_sw_batch,
-                native_e3nn=native_e3nn)
+                native_e3nn=native_e3nn,
+                n_downsample=n_downsample, model_scale=model_scale)
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if 'out of memory' not in str(e).lower() and 'CUDA' not in str(e):
                 raise
@@ -602,6 +1053,9 @@ def run_validation(
         pred_np = probs.argmax(axis=0).astype(np.int16)
         d = dice_score(pred_np, seg)
         elapsed = time.time() - tc
+        n_ens = (len(spacing_ensemble_members(spacing,
+                                               model=model if snap_arch else None))
+                 if spacing_ensemble else 1)
 
         # Save NIfTI prediction
         if pred_dir is not None:
@@ -617,9 +1071,10 @@ def run_validation(
             'time': round(elapsed, 2),
         })
 
+        ens_str = f", ens={n_ens}" if spacing_ensemble else ""
         print(f"[{i+1}/{len(val_cases_sorted)}] {case}: dice={d:.4f}, "
               f"spacing=({spacing[0]:.2f},{spacing[1]:.2f},{spacing[2]:.2f}), "
-              f"time={elapsed:.1f}s")
+              f"time={elapsed:.1f}s{ens_str}")
 
     total_time = time.time() - t0
     dices = [r['dice'] for r in results]
@@ -703,6 +1158,36 @@ def main():
     parser.add_argument('--native_e3nn', action='store_true',
                         help='Native e3nn inference: skip projection, pass spacing at forward time. '
                              'Required for runtime pyramid cap control.')
+    parser.add_argument('--use_group_spacing', action='store_true',
+                        help='Round each case spacing to canonical grid before projection/inference')
+    parser.add_argument('--spacing_ensemble', action='store_true',
+                        help='Ensemble inference at native + two nearest canonical spacings')
+    parser.add_argument('--snap_arch', action='store_true',
+                        help='Arch-aware spacing snap.  With --use_group_spacing: snap each case '
+                             'to the canonical grid point whose architecture best matches the '
+                             'native (L0 match first, then total matching levels, then distance).  '
+                             'With --spacing_ensemble: also add the arch-matched canonical as an '
+                             'extra ensemble member when it differs from the distance-nearest one.')
+    parser.add_argument('--spacing_jitter', type=float, default=0.0,
+                        help='Per-axis Gaussian std for inference-time kernel-sampling '
+                             'spacing jitter (default 0.0 = off).  Only affects kernel '
+                             'values, not pool cascade or kernel voxel sizes — architecture '
+                             'is invariant regardless of magnitude.  Ignored with --native_e3nn.')
+    parser.add_argument('--spacing_jitter_tta', type=int, default=1,
+                        help='Number of jittered draws per case (softmax-averaged). '
+                             'Default 1 = single draw.')
+    parser.add_argument('--patch_size_mm', type=float, nargs='+', default=None,
+                        help='Override the patch size (mm) used for sliding window inference. '
+                             'Pass 1 value (isotropic) or 3 values (D H W). '
+                             'Default: take from training config.')
+    parser.add_argument('--cases_key', type=str, default='val',
+                        help='Which key of splits_final.json[fold] to use as '
+                             'the case list (default: "val"; use "heldout" '
+                             'to evaluate on the per-fold held-out cases).')
+    parser.add_argument('--preprocessed_dir', type=str, default=None,
+                        help='Override the preprocessed_dir from config.json. '
+                             'Useful when evaluating an existing model on a '
+                             'different splits file.')
     args = parser.parse_args()
 
     run_validation(
@@ -717,6 +1202,14 @@ def main():
         no_train_counts=args.no_train_counts,
         mirror_tta=args.mirror_tta,
         native_e3nn=args.native_e3nn,
+        patch_size_mm=args.patch_size_mm,
+        use_group_spacing=args.use_group_spacing,
+        spacing_ensemble=args.spacing_ensemble,
+        snap_arch=args.snap_arch,
+        spacing_jitter=args.spacing_jitter,
+        spacing_jitter_tta=args.spacing_jitter_tta,
+        cases_key=args.cases_key,
+        preprocessed_dir_override=args.preprocessed_dir,
     )
 
 

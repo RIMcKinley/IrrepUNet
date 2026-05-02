@@ -3,7 +3,6 @@
 from .spacing import (
     SPACING_GRID, group_cases_by_spacing, get_canonical_permutation,
     apply_axis_permutation, round_to_grid, round_spacing_to_tolerance,
-    resolve_root_parent,
 )
 from .multi_resolution_loader import (
     estimate_memory_mb, estimate_batch_size,
@@ -14,7 +13,7 @@ from .multi_resolution_loader import (
 
 # PyTorch-dependent imports are optional (not available in JAX-only environments)
 try:
-    from .batchgen_dataset import E3nnDataset, E3nnDataLoader, SuperResDataLoader
+    from .batchgen_dataset import E3nnDataset, E3nnDataLoader
     from .batchgen_transforms import (
         get_training_transforms, get_validation_transforms,
     )
@@ -30,11 +29,9 @@ __all__ = [
     "apply_axis_permutation",
     "round_to_grid",
     "round_spacing_to_tolerance",
-    "resolve_root_parent",
     # Batchgenerators dataset/loaders
     "E3nnDataset",
     "E3nnDataLoader",
-    "SuperResDataLoader",
     # Batchgenerators transforms
     "get_training_transforms",
     "get_validation_transforms",

@@ -86,6 +86,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
+    args_dict['min_bottleneck_voxels'] = training.get('min_bottleneck_voxels', 1)
     args_dict['pooling_factor'] = training['pooling_factor']
     args_dict['resolution_jitter_sigma'] = training['resolution_jitter_sigma']
     args_dict['scale_jitter_std'] = training.get('scale_jitter_std', 0.0)
@@ -97,15 +98,15 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     aug = config['augmentation']
     args_dict['disable_spatial'] = aug.get('disable_spatial', True)
     args_dict['disable_mirroring'] = aug['disable_mirroring']
+    args_dict['bias_field'] = aug.get('bias_field', True)
+    args_dict['disable_intensity'] = aug.get('disable_intensity', False)
     args_dict['subsample_weight'] = aug['subsample_weight']
     args_dict['min_spacing'] = aug.get('min_spacing', 0.0)
     args_dict['max_inplane_spacing'] = aug.get('max_inplane_spacing', 0.0)
     args_dict['min_slice_thickness'] = aug.get('min_slice_thickness', 0.0)
     args_dict['max_slice_thickness'] = aug.get('max_slice_thickness', 0.0)
     args_dict['min_loader_cases'] = aug.get('min_loader_cases', 2)
-    args_dict['superres_training'] = aug.get('superres_training', False)
-    args_dict['superres_weight'] = aug.get('superres_weight', 0.1)
-    args_dict['group_balance'] = aug.get('group_balance', 0.0)
+    args_dict['sampling_temperature'] = aug.get('sampling_temperature', 1.0)
     args_dict['curriculum'] = aug.get('curriculum', None)
     args_dict['curriculum_bs_tiers'] = aug.get('curriculum_bs_tiers', None)
     args_dict['curriculum_phase_len'] = aug.get('curriculum_phase_len', 30)
@@ -383,7 +384,7 @@ def _write_plan_validation_log(args, output_dir: Path, config_hash: str = None):
 
 
 def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, model_scale=2.0,
-                        curriculum_phases=None):
+                        curriculum_phases=None, skipped_groups=None):
     """Write unified loader_config.txt used by both --plan_only and training."""
     lines = []
     lines.append("=" * 80)
@@ -444,28 +445,20 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
     lines.append("-" * 120)
 
     min_batch = getattr(args, 'min_batch_size', 1)
-    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
-    lines.append("-" * 162)
+    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
+    lines.append("-" * 156)
 
     shrunken = []  # (spacing_str, effective_mm, shortfall)
     SHRINK_TOL_MM = 4.0
 
     for group in sorted_groups:
         raw_spacing = group['spacing']
-
-        if isinstance(raw_spacing, (list, tuple)) and len(raw_spacing) == 3 and raw_spacing[0] == 'superres':
-            sub_sp = tuple(float(s) for s in raw_spacing[1])
-            orig_sp = tuple(float(s) for s in raw_spacing[2])
-            spacing_str = f"SR {sub_sp[0]:.2f},{sub_sp[1]:.2f},{sub_sp[2]:.2f}"
-            spacing = sub_sp
-        else:
-            spacing = tuple(float(s) for s in raw_spacing)
-            spacing_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+        spacing = tuple(float(s) for s in raw_spacing)
+        spacing_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
 
         patch_voxels = tuple(group['patch_size_voxels'])
         patch_str = f"{patch_voxels[0]}x{patch_voxels[1]}x{patch_voxels[2]}"
 
-        n_splits = group.get('n_spatial_splits', 1)
         bs = group['batch_size']
         accum = math.ceil(min_batch / bs) if bs < min_batch else 1
         eff_bs = bs * accum
@@ -494,7 +487,7 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
             shrunken.append((spacing_str, effective_mm, shortfall))
 
         val_bs = group.get('val_batch_size', bs)
-        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
+        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
 
     has_measured = any('measured_memory_bs1' in g for g in groups)
     if has_measured:
@@ -525,10 +518,7 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
 
     unique_spacings = []
     for group in sorted_groups:
-        raw_spacing = group['spacing']
-        if isinstance(raw_spacing, (list, tuple)) and len(raw_spacing) == 3 and raw_spacing[0] == 'superres':
-            continue
-        sp = tuple(float(s) for s in raw_spacing)
+        sp = tuple(float(s) for s in group['spacing'])
         if sp not in unique_spacings:
             unique_spacings.append(sp)
 

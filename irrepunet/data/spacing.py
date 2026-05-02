@@ -14,40 +14,87 @@ import numpy as np
 SPACING_GRID = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0)
 
 
-def round_to_grid(value: float, grid: tuple = SPACING_GRID) -> float:
+def set_spacing_grid(grid):
+    """Override the module-level ``SPACING_GRID`` at runtime.
+
+    Call this before any planning / grouping / rounding work so that
+    ``round_to_grid`` and ``round_spacing_to_tolerance`` pick up the new grid
+    (both read ``SPACING_GRID`` lazily when their ``grid`` argument is None).
+    Direct ``from ... import SPACING_GRID`` bindings in other modules still
+    reference the old tuple; prefer attribute access (``spacing.SPACING_GRID``)
+    or pass ``grid=`` explicitly at call sites that need the new value.
+    """
+    global SPACING_GRID
+    SPACING_GRID = tuple(sorted(float(v) for v in grid))
+    return SPACING_GRID
+
+
+def round_to_grid(value: float, grid: tuple = None) -> float:
     """Round a value to the nearest value in the grid.
 
     Parameters
     ----------
     value : float
         Value to round
-    grid : tuple
-        Allowed values to round to
-
-    Returns
-    -------
-    float
-        Nearest grid value
+    grid : tuple, optional
+        Allowed values to round to.  When ``None`` (default), the
+        module-level ``SPACING_GRID`` is used — read at call time so that
+        ``set_spacing_grid`` takes effect without rebinding callers.
     """
+    if grid is None:
+        grid = SPACING_GRID
     return min(grid, key=lambda x: abs(x - value))
 
 
-def round_spacing_to_tolerance(spacing: tuple) -> tuple:
+def round_spacing_to_tolerance(spacing: tuple, grid: tuple = None) -> tuple:
     """Round spacing values to the nearest values in the spacing grid.
-
-    Grid values: 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0 mm
 
     Parameters
     ----------
     spacing : tuple
         Spacing values (D, H, W)
-
-    Returns
-    -------
-    tuple
-        Rounded spacing values
+    grid : tuple, optional
+        Grid to round against.  When ``None`` (default), the module-level
+        ``SPACING_GRID`` is used at call time.
     """
-    return tuple(round_to_grid(s) for s in spacing)
+    return tuple(round_to_grid(s, grid=grid) for s in spacing)
+
+
+def _grid_neighbors(value: float, grid=None):
+    """Return (lo, hi) grid points bracketing ``value``.
+
+    Falls back to (value, value) when ``value`` is exactly on a grid point
+    or sits outside the grid entirely.
+    """
+    if grid is None:
+        grid = SPACING_GRID
+    below = [g for g in grid if g <= value]
+    above = [g for g in grid if g >= value]
+    lo = max(below) if below else grid[0]
+    hi = min(above) if above else grid[-1]
+    return lo, hi
+
+
+def _ambiguous_candidates(value: float, grid=None, ambiguity_threshold: float = 0.25):
+    """Return the grid values ``value`` should snap to.
+
+    Returns a list of one or two grid points.  When ``value`` sits near
+    the midpoint of its bracketing grid cell (``frac`` in
+    ``[0.5 - ambiguity_threshold, 0.5 + ambiguity_threshold]``), returns
+    both bracketing grid values so an ambiguous case can feed both
+    canonical groups during training.  Otherwise returns only the single
+    nearest grid point.
+    """
+    if grid is None:
+        grid = SPACING_GRID
+    lo, hi = _grid_neighbors(value, grid)
+    if hi <= lo:
+        return [lo]
+    frac = (value - lo) / (hi - lo)
+    nearest = lo if frac < 0.5 else hi
+    if ambiguity_threshold > 0 and 0.5 - ambiguity_threshold <= frac <= 0.5 + ambiguity_threshold:
+        return [lo, hi]
+    return [nearest]
 
 
 def group_cases_by_spacing(
@@ -56,6 +103,9 @@ def group_cases_by_spacing(
     max_inplane_spacing: float = 0.0,
     min_slice_thickness: float = 0.0,
     max_slice_thickness: float = 0.0,
+    inplane_tolerance: float = 0.1,
+    dual_assign_ambiguous: bool = False,
+    ambiguity_threshold: float = 0.25,
 ) -> Dict[tuple, List[str]]:
     """Group cases by their spacing using tiered tolerance rounding.
 
@@ -88,6 +138,7 @@ def group_cases_by_spacing(
     """
     groups: Dict[tuple, List[str]] = {}
 
+    dropped_anisotropic = 0
     for case_name, props in properties.items():
         spacing = tuple(props.get('spacing', (1.0, 1.0, 1.0)))
 
@@ -95,6 +146,16 @@ def group_cases_by_spacing(
         canonical_spacing = tuple(sorted(spacing))
         inplane_spacing = canonical_spacing[0]  # Finest = in-plane
         slice_thickness = canonical_spacing[2]  # Coarsest = slice thickness
+
+        # Drop cases whose in-plane axes (the two finest) are too anisotropic.
+        # Uses the same isotropy definition as the preprocessing step.
+        if inplane_tolerance > 0:
+            ip_mean = (canonical_spacing[0] + canonical_spacing[1]) / 2
+            if ip_mean > 0:
+                ip_rel_diff = abs(canonical_spacing[1] - canonical_spacing[0]) / ip_mean
+                if ip_rel_diff > inplane_tolerance:
+                    dropped_anisotropic += 1
+                    continue
 
         # Skip cases with spacing below min_spacing threshold
         if min_spacing > 0 and inplane_spacing < min_spacing:
@@ -112,14 +173,27 @@ def group_cases_by_spacing(
         if max_slice_thickness > 0 and slice_thickness > max_slice_thickness:
             continue
 
-        # Round using tiered tolerance for cleaner group keys
-        rounded_spacing = round_spacing_to_tolerance(canonical_spacing)
+        # Snap the in-plane pair to a shared value before grid-rounding so
+        # that float noise at grid midpoints (e.g. (2.75, 2.75, ...)) cannot
+        # split the pair across adjacent grid cells.
+        ip_mean = (canonical_spacing[0] + canonical_spacing[1]) / 2
 
-        # Find matching group (using rounded spacing as key)
-        if rounded_spacing in groups:
-            groups[rounded_spacing].append(case_name)
+        if dual_assign_ambiguous:
+            ip_targets = _ambiguous_candidates(ip_mean, ambiguity_threshold=ambiguity_threshold)
+            sl_targets = _ambiguous_candidates(canonical_spacing[2], ambiguity_threshold=ambiguity_threshold)
+            for ip_r in ip_targets:
+                for sl_r in sl_targets:
+                    rs = (ip_r, ip_r, sl_r)
+                    groups.setdefault(rs, []).append(case_name)
         else:
-            groups[rounded_spacing] = [case_name]
+            ip_rounded = round_to_grid(ip_mean)
+            sl_rounded = round_to_grid(canonical_spacing[2])
+            rounded_spacing = (ip_rounded, ip_rounded, sl_rounded)
+            groups.setdefault(rounded_spacing, []).append(case_name)
+
+    if dropped_anisotropic > 0:
+        print(f"  Dropped {dropped_anisotropic} cases with in-plane anisotropy > "
+              f"{inplane_tolerance:.0%}")
 
     return groups
 
@@ -165,30 +239,3 @@ def apply_axis_permutation(arr: np.ndarray, perm: tuple, has_channel: bool = Tru
     return np.transpose(arr, full_perm)
 
 
-def resolve_root_parent(case_id: str, properties: Dict[str, dict]) -> str:
-    """Walk the parent chain in metadata to find the original (non-subsampled) case.
-
-    Parent chains can be 2+ deep (e.g., case_0001_skip0_10x_skipxy_3x
-    -> case_0001_skip0_10x -> case_0001).
-
-    Parameters
-    ----------
-    case_id : str
-        The subsampled case identifier
-    properties : dict
-        Mapping from case_id to metadata dict (must contain 'parent' for subsampled cases)
-
-    Returns
-    -------
-    str
-        The root parent case identifier (the original, non-subsampled case)
-    """
-    current = case_id
-    visited = {current}
-    while current in properties and properties[current].get('is_subsampled', False):
-        parent = properties[current].get('parent')
-        if parent is None or parent in visited:
-            break
-        visited.add(parent)
-        current = parent
-    return current

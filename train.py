@@ -463,8 +463,13 @@ def _profile_single_step(
             outputs = model(x, spacing=spacing_t)
 
             if deep_supervision and isinstance(outputs, (list, tuple)):
-                # Build multi-scale targets
-                output_shapes = [o.shape[2:] for o in outputs]
+                # Build multi-scale targets; downsample_seg drops levels with
+                # any zero dim — filter outputs in the same way to keep the
+                # pred/target lists aligned for DeepSupervisionLoss.
+                valid = [(o, o.shape[2:]) for o in outputs
+                         if all(s > 0 for s in o.shape[2:])]
+                outputs = [o for o, _ in valid]
+                output_shapes = [s for _, s in valid]
                 multi_seg = downsample_seg_for_deep_supervision(seg, output_shapes)
                 loss = criterion(outputs, multi_seg)
             else:
@@ -542,6 +547,61 @@ def _profile_inference_step(
         return None
 
 
+def _axis_groups(spacing, tol=0.1):
+    """Group axes by similar spacing, ordered thick → thin.
+
+    Two axes belong to the same group when ``|sp_a - sp_b| / max(sp_a, sp_b)
+    < tol``.  Used by per-group patch-shrinking to keep in-plane axes
+    isotropic when reducing the patch size.
+
+    Returns a list of lists of axis indices (0..2), with the thickest group
+    first.  E.g. ``(0.25, 0.25, 4) → [[2], [0, 1]]``.
+    """
+    pairs = sorted(enumerate(spacing), key=lambda x: -x[1])  # thick → thin
+    groups = [[pairs[0][0]]]
+    cur_sp = pairs[0][1]
+    for axis, sp in pairs[1:]:
+        if cur_sp > 0 and abs(sp - cur_sp) / cur_sp < tol:
+            groups[-1].append(axis)
+        else:
+            groups.append([axis])
+            cur_sp = sp
+    return groups
+
+
+def _per_axis_pool_factors(spacing, n_downsample, model_scale):
+    """Cumulative pool factor per axis, replicating ``mm_to_voxels`` logic."""
+    from irrepunet.data.multi_resolution_loader import compute_steps_through_pooling
+    final_sp = compute_steps_through_pooling(spacing, n_downsample, model_scale)[-1]
+    return tuple(max(1, int(round(final_sp[i] / spacing[i]))) for i in range(3))
+
+
+def _shrink_patch_mm_one_step(current_mm, voxels, spacing, axis_groups,
+                              pool_factors, min_bottleneck=1):
+    """Shrink the thickest axis-group where every axis can still shrink.
+
+    Returns the new patch_mm tuple, or ``None`` if no group can shrink
+    further.  All axes in a group shrink together by one pool-factor unit
+    each (keeps in-plane isotropic).
+    """
+    new_mm = list(current_mm)
+    for group in axis_groups:  # thick → thin
+        proposed = {}
+        ok = True
+        for axis in group:
+            cur_v = (voxels[axis] // pool_factors[axis]) * pool_factors[axis]
+            nv = cur_v - pool_factors[axis]
+            if nv < pool_factors[axis] * min_bottleneck:
+                ok = False
+                break
+            proposed[axis] = nv
+        if ok:
+            for axis, nv in proposed.items():
+                new_mm[axis] = nv * spacing[axis]
+            return tuple(new_mm)
+    return None  # exhausted
+
+
 class ExperimentPlanner:
     """Plans training experiments without executing them."""
 
@@ -578,7 +638,8 @@ class ExperimentPlanner:
 
         return metadata
 
-    def compute_patch_size_voxels(self, spacing: Tuple[float, float, float]) -> Tuple[int, int, int]:
+    def compute_patch_size_voxels(self, spacing: Tuple[float, float, float],
+                                  patch_size_mm: Optional[Tuple[float, float, float]] = None) -> Tuple[int, int, int]:
         """Convert mm patch size to voxels for a given spacing.
 
         Uses the same algorithm as MultiResolutionLoader._mm_to_voxels():
@@ -587,13 +648,16 @@ class ExperimentPlanner:
 
         Args:
             spacing: Voxel spacing in mm (D, H, W)
+            patch_size_mm: Optional per-group patch size override.  Defaults
+                to the planner's ``self.patch_size_mm``.
 
         Returns:
             Patch size in voxels (D, H, W)
         """
         model_scale = getattr(self.args, 'scale', 2.0)
+        target_mm = patch_size_mm if patch_size_mm is not None else self.patch_size_mm
         return mm_to_voxels(
-            self.patch_size_mm, spacing,
+            target_mm, spacing,
             self.args.n_downsample, model_scale,
         )
 
@@ -675,7 +739,7 @@ class ExperimentPlanner:
             profile_sp = getattr(self, '_profile_spacings', {}).get(tuple(spacing), tuple(spacing))
             key = (tuple(patch_voxels), tuple(profile_sp))
             profile = self._profiled_memory.get(key)
-            if (profile is not None and profile.get('status') == 'ok'
+            if (profile is not None and profile.get('status') in ('ok', 'val_only')
                     and profile.get('mem_bs1_val') is not None
                     and profile.get('per_item_val') is not None):
                 mem_bs1_val = profile['mem_bs1_val']
@@ -695,17 +759,79 @@ class ExperimentPlanner:
         # No profile available — fall back to training batch size (safe)
         return self.compute_batch_size(patch_voxels, spacing=spacing)
 
+    def _shrink_to_fit(self, spacing, target_mm, target_mem_mb,
+                       profile_fn, max_iter=20):
+        """Iteratively shrink ``patch_size_mm`` until bs=1 fits target memory.
+
+        Strategy (anisotropic, "thick first"):
+          - Group axes by spacing similarity (in-plane treated together).
+          - At each step shrink the thickest still-shrinkable group by one
+            pool-factor unit per axis.
+          - Stop when bs=1 fits, or when no group can shrink further while
+            keeping ``min_bottleneck`` voxels at the bottleneck of every axis.
+
+        Parameters
+        ----------
+        spacing : tuple
+            Group canonical spacing.
+        target_mm : tuple
+            Initial patch size in mm (e.g. user's --patch_size_mm).
+        target_mem_mb : float
+            Memory budget for bs=1 (already includes safety margin).
+        profile_fn : callable(patch_voxels, spacing, batch_size) -> mem_mb or None
+            Returns peak GPU memory in MB for one fwd+bwd at the given config,
+            or ``None`` on OOM.
+
+        Returns
+        -------
+        (final_mm, final_voxels, final_mem) : tuple
+            ``final_mem`` is ``None`` if no shrunken patch fits.
+        """
+        n_down = self.args.n_downsample
+        model_scale = getattr(self.args, 'scale', 2.0)
+        min_bot = getattr(self.args, 'min_bottleneck_voxels', 1)
+
+        groups = _axis_groups(spacing)
+        pool_factors = _per_axis_pool_factors(spacing, n_down, model_scale)
+
+        current_mm = tuple(target_mm)
+        attempts = []
+
+        for it in range(max_iter):
+            voxels = mm_to_voxels(current_mm, spacing, n_down, model_scale)
+            mem = profile_fn(voxels, spacing, 1)
+            attempts.append((current_mm, voxels, mem))
+            if mem is not None and mem <= target_mem_mb:
+                return current_mm, voxels, mem
+            new_mm = _shrink_patch_mm_one_step(
+                current_mm, voxels, spacing, groups, pool_factors,
+                min_bottleneck=min_bot,
+            )
+            if new_mm is None:
+                break  # exhausted
+            current_mm = new_mm
+
+        # No fit found — return the smallest attempt
+        if attempts:
+            return attempts[-1]
+        return current_mm, voxels, None
+
     def _create_group_config(
         self,
         group_id: int,
         spacing: Tuple[float, float, float],
         cases: List[str],
         subsampled_cases: Optional[set] = None,
-        n_spatial_splits: int = 1,
+        patch_size_mm: Optional[Tuple[float, float, float]] = None,
     ) -> Dict:
-        """Create configuration for a single loader group."""
-        # Compute patch size in voxels
-        patch_voxels = self.compute_patch_size_voxels(spacing)
+        """Create configuration for a single loader group.
+
+        ``patch_size_mm`` overrides the planner's global patch size for this
+        group only (used when the global size was shrunk to fit memory).
+        """
+        # Compute patch size in voxels (per-group mm if provided)
+        group_patch_mm = patch_size_mm if patch_size_mm is not None else self.patch_size_mm
+        patch_voxels = self.compute_patch_size_voxels(spacing, patch_size_mm=group_patch_mm)
 
         # Compute batch size (uses profiled memory when available)
         batch_size = self.compute_batch_size(patch_voxels, spacing=spacing)
@@ -720,12 +846,12 @@ class ExperimentPlanner:
             profile_sp = getattr(self, '_profile_spacings', {}).get(tuple(spacing), tuple(spacing))
             key = (tuple(patch_voxels), tuple(profile_sp))
             profile = self._profiled_memory.get(key)
-            if profile is not None and profile['status'] == 'ok':
+            if profile is not None and profile['status'] in ('ok', 'val_only'):
                 measured_bs1 = profile['mem_bs1']
                 measured_bs2 = profile['mem_bs2']
                 measured_bs1_val = profile.get('mem_bs1_val')
                 measured_bs2_val = profile.get('mem_bs2_val')
-                mem_mb = measured_bs1  # Report bs=1 measured memory
+                mem_mb = measured_bs1 if measured_bs1 is not None else measured_bs1_val
             elif profile is not None and profile['status'] in ('oom', 'oom_skipped'):
                 mem_mb = float('inf')
             else:
@@ -759,10 +885,9 @@ class ExperimentPlanner:
             "group_id": group_id,
             "spacing": list(spacing),
             "patch_size_voxels": list(patch_voxels),
-            "patch_size_mm": list(self.patch_size_mm),
+            "patch_size_mm": list(group_patch_mm),
             "batch_size": batch_size,
             "val_batch_size": val_batch_size,
-            "n_spatial_splits": n_spatial_splits,
             "estimated_memory_mb": round(mem_mb, 1) if mem_mb != float('inf') else None,
             "case_ids": cases,
             "group_type": group_type,
@@ -840,9 +965,11 @@ class ExperimentPlanner:
             max_inplane_spacing = getattr(self.args, 'max_inplane_spacing', 0.0)
             min_slice_thickness = getattr(self.args, 'min_slice_thickness', 0.0)
             max_slice_thickness = getattr(self.args, 'max_slice_thickness', 0.0)
+            dual_assign = getattr(self.args, 'dual_assign_ambiguous', False)
             spacing_groups = group_cases_by_spacing(
                 all_properties, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+                dual_assign_ambiguous=dual_assign)
         else:
             # Use original metadata only
             train_metadata = {cid: metadata[cid] for cid in train_cases}
@@ -850,9 +977,11 @@ class ExperimentPlanner:
             max_inplane_spacing = getattr(self.args, 'max_inplane_spacing', 0.0)
             min_slice_thickness = getattr(self.args, 'min_slice_thickness', 0.0)
             max_slice_thickness = getattr(self.args, 'max_slice_thickness', 0.0)
+            dual_assign = getattr(self.args, 'dual_assign_ambiguous', False)
             spacing_groups = group_cases_by_spacing(
                 train_metadata, min_spacing=min_spacing, max_inplane_spacing=max_inplane_spacing,
-                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness)
+                min_slice_thickness=min_slice_thickness, max_slice_thickness=max_slice_thickness,
+                dual_assign_ambiguous=dual_assign)
             all_properties = train_metadata
 
         print(f"  Resolution groups: {len(spacing_groups)}")
@@ -874,7 +1003,7 @@ class ExperimentPlanner:
         eligible_groups = []
         for spacing, cases in sorted(spacing_groups.items()):
             if len(cases) < min_loader_cases:
-                skipped_groups.append((spacing, f"too few cases ({len(cases)} < {min_loader_cases})"))
+                skipped_groups.append((spacing, f"too few cases ({len(cases)} < {min_loader_cases})", len(cases)))
             else:
                 eligible_groups.append((spacing, cases))
 
@@ -886,25 +1015,36 @@ class ExperimentPlanner:
         self._profile_spacings = {}  # canonical_spacing → profile_spacing
         patch_configs = []
         worst_case_info = []
+        use_group_sp = getattr(self.args, 'use_group_spacing', False)
         for spacing, cases in eligible_groups:
             patch_voxels = self.compute_patch_size_voxels(spacing)
             canonical_vol = _activation_volume(spacing, scales, patch_voxels)
 
-            # Find worst-case actual spacing in this group
-            worst_spacing = spacing
-            worst_vol = canonical_vol
-            actual_spacings = set()
-            for cid in cases:
-                props = all_properties.get(cid)
-                if props is not None:
-                    sp = tuple(sorted(props['spacing']))
-                    actual_spacings.add(sp)
-            for sp in actual_spacings:
-                # Compute patch_voxels at canonical spacing (matches training)
-                vol = _activation_volume(sp, scales, patch_voxels)
-                if vol > worst_vol:
-                    worst_vol = vol
-                    worst_spacing = sp
+            if use_group_sp:
+                # Training snaps cases to canonical spacing at runtime, so
+                # profiling at canonical matches what the model actually sees.
+                # (Without this, the planner picks a worst-case native that
+                # can cross architecture-key boundaries — e.g. 1.0-iso profiled
+                # at (1.0, 1.016, 1.016) measures 2x the canonical memory.)
+                worst_spacing = spacing
+                worst_vol = canonical_vol
+            else:
+                # Find worst-case actual spacing in this group so profiling
+                # doesn't underestimate memory for the native-spacing training.
+                worst_spacing = spacing
+                worst_vol = canonical_vol
+                actual_spacings = set()
+                for cid in cases:
+                    props = all_properties.get(cid)
+                    if props is not None:
+                        sp = tuple(sorted(props['spacing']))
+                        actual_spacings.add(sp)
+                for sp in actual_spacings:
+                    # Compute patch_voxels at canonical spacing (matches training)
+                    vol = _activation_volume(sp, scales, patch_voxels)
+                    if vol > worst_vol:
+                        worst_vol = vol
+                        worst_spacing = sp
 
             if worst_spacing != spacing:
                 ratio = worst_vol / canonical_vol
@@ -1068,64 +1208,129 @@ class ExperimentPlanner:
                     print(f"    {sp}: kept {n_kept}/{n_orig} cases ({n_excl} excluded), "
                           f"worst kept ratio {ratio:.2f}x")
 
+        # Per-group patch-mm shrinking: groups whose bs=1 still exceeds the
+        # memory budget are NOT dropped — instead, shrink their patch_size_mm
+        # anisotropically (thick axis first; in-plane axes shrink together)
+        # until bs=1 fits, or until shrinking is exhausted.
+        per_group_patch_mm = {}  # spacing → (d, h, w) mm
+        if torch.cuda.is_available() and self._profiled_memory:
+            effective_target = self.args.target_memory_mb * 0.85
+            shrink_candidates = []
+            for spacing, cases in eligible_groups:
+                patch_voxels = self.compute_patch_size_voxels(spacing)
+                profile_sp = self._profile_spacings.get(spacing, spacing)
+                key = (tuple(patch_voxels), tuple(profile_sp))
+                profile = self._profiled_memory.get(key)
+                if profile is None:
+                    continue
+                if profile['status'] in ('oom', 'oom_skipped'):
+                    shrink_candidates.append((spacing, cases, profile_sp))
+                elif profile['status'] == 'ok' and profile['mem_bs1'] > effective_target:
+                    shrink_candidates.append((spacing, cases, profile_sp))
+
+            if shrink_candidates:
+                print(f"\n  Per-group patch shrinking: {len(shrink_candidates)} groups exceed "
+                      f"effective target {effective_target:.0f} MB at the requested "
+                      f"patch_size_mm={tuple(self.patch_size_mm)}")
+
+                # Build a single model + optimiser for repeated profiling
+                from irrepunet.training.losses import DiceCELoss, DeepSupervisionLoss
+                base_criterion = DiceCELoss(ce_weight=1.0, dice_weight=1.0)
+                if self.args.deep_supervision:
+                    criterion = DeepSupervisionLoss(base_loss=base_criterion,
+                                                    n_scales=self.args.n_downsample)
+                else:
+                    criterion = base_criterion
+                amp_dtype = torch.bfloat16 if self.args.fp16 else torch.float32
+                shrink_model = E3nnUNet(**model_kwargs).to(device)
+                shrink_optimizer = AdamW(shrink_model.parameters(),
+                                         lr=0.01, weight_decay=3e-5)
+
+                def _profile_shrunk(patch_voxels, sp, batch_size):
+                    return _profile_single_step(
+                        shrink_model, shrink_optimizer, criterion, device, amp_dtype,
+                        patch_voxels, sp, model_kwargs['n_classes'],
+                        batch_size=batch_size,
+                        deep_supervision=self.args.deep_supervision,
+                    )
+
+                use_group_sp = getattr(self.args, 'use_group_spacing', False)
+
+                for spacing, cases, profile_sp in shrink_candidates:
+                    # When use_group_spacing is True, training runs at canonical
+                    # group spacing — so profile shrinking at canonical, not at
+                    # worst-case actual spacing (which has larger kernels and
+                    # can OOM even at the minimum patch size).
+                    shrink_sp = spacing if use_group_sp else profile_sp
+
+                    final_mm, final_voxels, final_mem = self._shrink_to_fit(
+                        spacing=shrink_sp,
+                        target_mm=tuple(self.patch_size_mm),
+                        target_mem_mb=effective_target,
+                        profile_fn=_profile_shrunk,
+                        max_iter=20,
+                    )
+                    sp_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+                    # Determine the profile key used by _create_group_config
+                    lookup_sp = self._profile_spacings.get(spacing, spacing)
+                    if final_mem is not None and final_mem <= effective_target:
+                        per_group_patch_mm[spacing] = final_mm
+                        # Cache the new profile so _create_group_config picks it up.
+                        # Key must match what the group-creation loop computes.
+                        self._profiled_memory[(tuple(final_voxels), tuple(lookup_sp))] = {
+                            'mem_bs1': round(final_mem, 1),
+                            'mem_bs2': None,
+                            'per_item': round(final_mem * 0.85, 1),  # heuristic
+                            'mem_bs1_val': None,
+                            'mem_bs2_val': None,
+                            'per_item_val': None,
+                            'status': 'ok',
+                        }
+                        print(f"    {sp_str}: shrunk to "
+                              f"({final_mm[0]:.0f}, {final_mm[1]:.0f}, {final_mm[2]:.0f}) mm "
+                              f"= voxels {tuple(final_voxels)}, mem={final_mem:.0f} MB")
+                    else:
+                        mem_str = f"{final_mem:.0f} MB" if final_mem is not None else "OOM"
+                        print(f"    {sp_str}: SHRINK EXHAUSTED at "
+                              f"({final_mm[0]:.0f}, {final_mm[1]:.0f}, {final_mm[2]:.0f}) mm "
+                              f"({mem_str} vs target {effective_target:.0f} MB)")
+
+                # Free the dedicated shrink-profile model
+                del shrink_model, shrink_optimizer, criterion
+                torch.cuda.empty_cache()
+
         # Create group configs using profiled memory
+        effective_target = self.args.target_memory_mb * 0.85
         for spacing, cases in eligible_groups:
-            patch_voxels = self.compute_patch_size_voxels(spacing)
+            group_patch_mm = per_group_patch_mm.get(spacing, tuple(self.patch_size_mm))
+            patch_voxels = self.compute_patch_size_voxels(spacing, patch_size_mm=group_patch_mm)
             profile_sp = self._profile_spacings.get(spacing, spacing)
             key = (tuple(patch_voxels), tuple(profile_sp))
             profile = self._profiled_memory.get(key)
 
-            # Check if bs=1 OOMs
+            # Drop groups whose bs=1 OOMs (or exceeds the 15% safety margin).
             if profile and profile['status'] in ('oom', 'oom_skipped'):
-                # Determine spatial splits needed
-                n_spatial_splits = 1
-                test_patch = list(patch_voxels)
-                fits = False
-                while n_spatial_splits <= 16:
-                    n_spatial_splits *= 2
-                    max_dim_idx = test_patch.index(max(test_patch))
-                    test_patch[max_dim_idx] = max(
-                        self.args.pooling_factor,
-                        test_patch[max_dim_idx] // 2
-                    )
-                    # Check if the split patch was profiled and fits
-                    split_key = (tuple(test_patch), tuple(spacing))
-                    split_profile = self._profiled_memory.get(split_key)
-                    if split_profile and split_profile['status'] == 'ok':
-                        fits = True
-                        break
-                    elif split_profile is None:
-                        # Not profiled — use parametric fallback
-                        est = estimate_memory_mb(
-                            patch_size=tuple(test_patch),
-                            n_base_filters=self.args.n_base_filters,
-                            batch_size=1,
-                            n_downsample=self.args.n_downsample,
-                            fp16=self.args.fp16,
-                        )
-                        if est <= self.args.target_memory_mb:
-                            fits = True
-                            break
-
-                if not fits:
-                    skipped_groups.append((spacing, f"OOM at bs=1, needs >{16} spatial splits"))
-                    continue
-            elif profile and profile['status'] == 'ok':
-                # Check if profiled bs=1 exceeds target memory (with 15% safety margin)
-                effective_target = self.args.target_memory_mb * 0.85
+                skipped_groups.append((spacing, "OOM at bs=1", len(cases)))
+                continue
+            if profile and profile['status'] == 'ok':
                 if profile['mem_bs1'] > effective_target:
-                    skipped_groups.append((spacing, f"OOM: measured {profile['mem_bs1']:.0f} MB > effective target {effective_target:.0f} MB (15% safety margin)"))
+                    skipped_groups.append((spacing, f"OOM: measured {profile['mem_bs1']:.0f} MB > target {effective_target:.0f} MB", len(cases)))
                     continue
-                n_spatial_splits = 1
-            else:
-                n_spatial_splits = 1
+            # Groups with no profile at the (possibly-shrunk) patch landed here
+            # because shrinking exhausted without caching. If the group was a
+            # shrink candidate (i.e. its ORIGINAL profile exceeded the budget),
+            # treat it as a skip — otherwise it was never profiled and we
+            # include it with estimated memory (legacy behaviour).
+            if profile is None and spacing in per_group_patch_mm:
+                skipped_groups.append((spacing, "shrink exhausted (still exceeds target)", len(cases)))
+                continue
 
             real_config = self._create_group_config(
                 group_id=len(loader_groups),
                 spacing=spacing,
                 cases=cases,
                 subsampled_cases=subsampled_cases if subsampled_cases else None,
-                n_spatial_splits=n_spatial_splits,
+                patch_size_mm=group_patch_mm,
             )
             loader_groups.append(real_config)
 
@@ -1134,10 +1339,84 @@ class ExperimentPlanner:
 
         # Report skipped groups
         if skipped_groups:
-            print(f"\nSkipped {len(skipped_groups)} loader groups:")
-            for spacing, reason in skipped_groups:
+            total_dropped = sum(n for _, _, n in skipped_groups)
+            print(f"\nSkipped {len(skipped_groups)} loader groups from training ({total_dropped} cases):")
+            for spacing, reason, n_cases in skipped_groups:
                 spacing_str = tuple(f"{s:.2f}" for s in spacing)
-                print(f"  {spacing_str}: {reason}")
+                print(f"  {spacing_str}: {reason} ({n_cases} cases)")
+
+        # Val-only groups: OOM-skipped groups may still fit for validation
+        # (inference uses ~60% less memory than training).
+        eligible_by_spacing = {sp: cases for sp, cases in eligible_groups}
+        oom_skipped = [
+            (sp, reason, n) for sp, reason, n in skipped_groups
+            if 'OOM' in reason or 'shrink exhausted' in reason
+        ]
+        if oom_skipped and torch.cuda.is_available() and hasattr(self, '_profiled_memory'):
+            print(f"\n  Checking {len(oom_skipped)} OOM-skipped groups for val-only use...")
+            val_target = (getattr(self.args, 'val_target_memory_mb', 0)
+                          or self.args.target_memory_mb) * 0.85
+            amp_dtype = torch.bfloat16 if self.args.fp16 else torch.float32
+            val_model = E3nnUNet(**model_kwargs).to(device)
+            val_model.eval()
+
+            for spacing, reason, n_cases in oom_skipped:
+                cases = eligible_by_spacing.get(spacing, [])
+                if not cases:
+                    continue
+                group_patch_mm = per_group_patch_mm.get(spacing, tuple(self.patch_size_mm))
+                patch_voxels = self.compute_patch_size_voxels(spacing, patch_size_mm=group_patch_mm)
+                sp_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+
+                # Profile inference at bs=1
+                val_mem = _profile_inference_step(
+                    val_model, device, amp_dtype,
+                    patch_voxels, spacing, model_kwargs['n_classes'],
+                    batch_size=1,
+                )
+                if val_mem is None or val_mem > val_target:
+                    if val_mem is not None:
+                        print(f"    {sp_str}: val OOM too ({val_mem:.0f} MB > {val_target:.0f} MB)")
+                    else:
+                        print(f"    {sp_str}: val OOM at bs=1")
+                    continue
+
+                # Profile bs=2 for batch size estimation
+                val_mem_bs2 = _profile_inference_step(
+                    val_model, device, amp_dtype,
+                    patch_voxels, spacing, model_kwargs['n_classes'],
+                    batch_size=2,
+                )
+                per_item_val = (val_mem_bs2 - val_mem) if val_mem_bs2 is not None else val_mem * 0.85
+
+                # Cache profile for val batch size computation
+                profile_sp = self._profile_spacings.get(spacing, spacing)
+                key = (tuple(patch_voxels), tuple(profile_sp))
+                self._profiled_memory[key] = {
+                    'mem_bs1': None, 'mem_bs2': None, 'per_item': None,
+                    'mem_bs1_val': round(val_mem, 1),
+                    'mem_bs2_val': round(val_mem_bs2, 1) if val_mem_bs2 else None,
+                    'per_item_val': round(per_item_val, 1),
+                    'status': 'val_only',
+                }
+
+                val_batch_size = self.compute_val_batch_size(patch_voxels, spacing=spacing)
+                real_config = self._create_group_config(
+                    group_id=len(loader_groups),
+                    spacing=spacing,
+                    cases=cases,
+                    subsampled_cases=subsampled_cases if subsampled_cases else None,
+                    patch_size_mm=group_patch_mm,
+                )
+                real_config['batch_size'] = 0
+                real_config['val_batch_size'] = val_batch_size
+                real_config['group_type'] = 'val_only'
+                loader_groups.append(real_config)
+                print(f"    {sp_str}: val_only, val_bs={val_batch_size}, "
+                      f"val_mem={val_mem:.0f} MB ({n_cases} cases)")
+
+            del val_model
+            torch.cuda.empty_cache()
 
         # Bottleneck kernel optimization
         bottleneck_kernel = getattr(self.args, 'bottleneck_kernel', 0)
@@ -1221,11 +1500,13 @@ class ExperimentPlanner:
                 "val_target_memory_mb": getattr(self.args, 'val_target_memory_mb', 0),
                 "min_batch_size": self.args.min_batch_size,
                 "max_batch_size": self.args.max_batch_size,
+                "min_bottleneck_voxels": getattr(self.args, 'min_bottleneck_voxels', 1),
                 "pooling_factor": self.args.pooling_factor,
                 "resolution_jitter_sigma": self.args.resolution_jitter_sigma,
                 "scale_jitter_std": getattr(self.args, 'scale_jitter_std', 0.0),
                 "num_workers": self.args.num_workers,
                 "init_checkpoint": getattr(self.args, 'init_checkpoint', None),
+                "fixed_lr": getattr(self.args, 'fixed_lr', False),
                 "wandb": getattr(self.args, 'wandb', False),
                 "wandb_project": getattr(self.args, 'wandb_project', 'irrepunet'),
                 "wandb_name": getattr(self.args, 'wandb_name', None),
@@ -1239,15 +1520,17 @@ class ExperimentPlanner:
                 "max_inplane_spacing": getattr(self.args, 'max_inplane_spacing', 0.0),
                 "min_slice_thickness": getattr(self.args, 'min_slice_thickness', 0.0),
                 "max_slice_thickness": getattr(self.args, 'max_slice_thickness', 0.0),
+                "spacing_grid": getattr(self.args, 'spacing_grid_values', None),
                 "min_loader_cases": getattr(self.args, 'min_loader_cases', 2),
-                "superres_training": getattr(self.args, 'superres_training', False),
-                "superres_weight": getattr(self.args, 'superres_weight', 0.1),
-                "group_balance": getattr(self.args, 'group_balance', 0.0),
+                "sampling_temperature": getattr(self.args, 'sampling_temperature', 1.0),
+                "mixed_group_real_floor": getattr(self.args, 'mixed_group_real_floor', 0.25),
+                "dual_assign_ambiguous": getattr(self.args, 'dual_assign_ambiguous', False),
                 "bias_field": getattr(self.args, 'bias_field', True),
                 "curriculum": getattr(self.args, 'curriculum', None),
                 "curriculum_bs_tiers": getattr(self.args, 'curriculum_bs_tiers', None),
                 "curriculum_phase_len": getattr(self.args, 'curriculum_phase_len', 30),
                 "use_group_spacing": getattr(self.args, 'use_group_spacing', False),
+                "native_kernel_scale": getattr(self.args, 'native_kernel_scale', False),
             },
 
             "hardware": {
@@ -1259,6 +1542,10 @@ class ExperimentPlanner:
             },
 
             "loader_groups": loader_groups,
+            "skipped_loader_groups": [
+                {"spacing": list(sp), "reason": reason, "n_cases": n}
+                for sp, reason, n in skipped_groups
+            ],
             "reference_spacing": list(reference_spacing) if reference_spacing else None,
         }
 
@@ -1307,10 +1594,7 @@ class ExperimentPlanner:
         patch_mm = tuple(self.args.patch_size_mm)
         shrunken = []
         for g in config['loader_groups']:
-            raw_sp = g['spacing']
-            if isinstance(raw_sp, (list, tuple)) and len(raw_sp) == 3 and raw_sp[0] == 'superres':
-                continue
-            sp = tuple(float(s) for s in raw_sp)
+            sp = tuple(float(s) for s in g['spacing'])
             pv = tuple(g['patch_size_voxels'])
             eff = tuple(v * s for v, s in zip(pv, sp))
             sh = tuple(max(0.0, r - e) for r, e in zip(patch_mm, eff))
@@ -1345,7 +1629,6 @@ class ExperimentPlanner:
                 'val_batch_size': g.get('val_batch_size', g['batch_size']),
                 'estimated_memory_mb': g.get('estimated_memory_mb') or g.get('measured_memory_bs1', 0),
                 'n_cases': len(g['case_ids']),
-                'n_spatial_splits': g.get('n_spatial_splits', 1),
                 'group_type': g.get('group_type', 'real'),
             }
             if 'measured_memory_bs1' in g:
@@ -1369,6 +1652,7 @@ class ExperimentPlanner:
             n_train_cases=len(config['data']['train_cases']),
             n_val_cases=len(config['data']['val_cases']),
             curriculum_phases=curriculum_phases,
+            skipped_groups=config.get('skipped_loader_groups', []),
         )
 
     def _generate_run_script(self, config: Dict):
@@ -1407,7 +1691,7 @@ class ExperimentPlanner:
 # =============================================================================
 
 def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, model_scale=2.0,
-                        curriculum_phases=None):
+                        curriculum_phases=None, skipped_groups=None):
     """Write unified loader_config.txt used by both --plan_only and training.
 
     Parameters
@@ -1493,8 +1777,8 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
 
     # Table header
     min_batch = getattr(args, 'min_batch_size', 1)
-    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Split':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
-    lines.append("-" * 162)
+    lines.append(f"{'Spacing (mm)':<22} {'Patch (voxels)':<18} {'Patch (mm)':<16} {'Batch':<6} {'ValBS':<6} {'Accum':<6} {'Eff.BS':<7} {'Cases':<7} {'Type':<12} {'Memory':<10} {'RF Error (mm)':<20}")
+    lines.append("-" * 156)
 
     shrunken = []
     SHRINK_TOL_MM = 4.0
@@ -1502,26 +1786,17 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
     # Table rows
     for group in sorted_groups:
         raw_spacing = group['spacing']
-
-        # Handle superres groups: ('superres', sub_sp, orig_sp)
-        if isinstance(raw_spacing, (list, tuple)) and len(raw_spacing) == 3 and raw_spacing[0] == 'superres':
-            sub_sp = tuple(float(s) for s in raw_spacing[1])
-            orig_sp = tuple(float(s) for s in raw_spacing[2])
-            spacing_str = f"SR {sub_sp[0]:.2f},{sub_sp[1]:.2f},{sub_sp[2]:.2f}"
-            spacing = sub_sp
-        else:
-            spacing = tuple(float(s) for s in raw_spacing)
-            spacing_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+        spacing = tuple(float(s) for s in raw_spacing)
+        spacing_str = f"({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
 
         patch_voxels = tuple(group['patch_size_voxels'])
 
         # Format patch size
         patch_str = f"{patch_voxels[0]}x{patch_voxels[1]}x{patch_voxels[2]}"
 
-        # Spatial splits and gradient accumulation
-        n_splits = group.get('n_spatial_splits', 1)
+        # Gradient accumulation (for bs below min_batch)
         bs = group['batch_size']
-        accum = math.ceil(min_batch / bs) if bs < min_batch else 1
+        accum = math.ceil(min_batch / bs) if 0 < bs < min_batch else 1
         eff_bs = bs * accum
 
         # RF verification
@@ -1553,7 +1828,7 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
             shrunken.append((spacing_str, effective_mm, shortfall))
 
         val_bs = group.get('val_batch_size', bs)
-        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {n_splits:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
+        lines.append(f"{spacing_str:<22} {patch_str:<18} {patch_mm_str:<16} {bs:<6} {val_bs:<6} {accum:<6} {eff_bs:<7} {group['n_cases']:<7} {group_type:<12} {mem_str:<10} {rf_err_str:<20}")
 
     # Footnote for measured memory
     has_measured = any('measured_memory_bs1' in g for g in groups)
@@ -1576,6 +1851,19 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
 
     lines.append("")
 
+    # Skipped groups
+    if skipped_groups:
+        total_dropped = sum(g.get('n_cases', 0) for g in skipped_groups)
+        lines.append(f"SKIPPED GROUPS ({len(skipped_groups)} groups, {total_dropped} cases excluded)")
+        lines.append("-" * 120)
+        lines.append(f"{'Spacing (mm)':<22} {'Cases':<8} {'Reason'}")
+        lines.append("-" * 120)
+        for g in sorted(skipped_groups, key=lambda x: -x.get('n_cases', 0)):
+            sp = tuple(float(s) for s in g['spacing'])
+            sp_str = f"({sp[0]:.2f}, {sp[1]:.2f}, {sp[2]:.2f})"
+            lines.append(f"{sp_str:<22} {g.get('n_cases', '?'):<8} {g['reason']}")
+        lines.append("")
+
     # Kernel size table
     scale = getattr(args, 'scale', 2.0)
     trim_th = getattr(args, 'kernel_trim_threshold', 1.0)
@@ -1587,10 +1875,7 @@ def write_loader_config(filepath, args, groups, n_train_cases, n_val_cases, mode
     # Collect unique spacings from groups
     unique_spacings = []
     for group in sorted_groups:
-        raw_spacing = group['spacing']
-        if isinstance(raw_spacing, (list, tuple)) and len(raw_spacing) == 3 and raw_spacing[0] == 'superres':
-            continue  # skip superres groups
-        sp = tuple(float(s) for s in raw_spacing)
+        sp = tuple(float(s) for s in group['spacing'])
         if sp not in unique_spacings:
             unique_spacings.append(sp)
 
@@ -2024,7 +2309,8 @@ def _write_plan_validation_log(args, output_dir: Path, config_hash: str = None):
 # =============================================================================
 
 def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
-          planned_val_batch_sizes: dict = None):
+          planned_val_batch_sizes: dict = None,
+          planned_patch_sizes_mm: dict = None):
     # Enable TF32 for matmuls — ~35% speedup on Ampere+ GPUs with negligible precision loss
     torch.set_float32_matmul_precision('high')
 
@@ -2129,10 +2415,11 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         min_slice_thickness=getattr(args, 'min_slice_thickness', 0.0),
         max_slice_thickness=getattr(args, 'max_slice_thickness', 0.0),
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
-        superres_training=getattr(args, 'superres_training', False),
-        superres_weight=getattr(args, 'superres_weight', 0.1),
-        group_balance=getattr(args, 'group_balance', 0.0),
+        sampling_temperature=getattr(args, 'sampling_temperature', 1.0),
+        mixed_group_real_floor=getattr(args, 'mixed_group_real_floor', 0.25),
+        dual_assign_ambiguous=getattr(args, 'dual_assign_ambiguous', False),
         planned_batch_sizes=planned_batch_sizes,
+        planned_patch_sizes_mm=planned_patch_sizes_mm,
         rank=rank,
         world_size=world_size,
         sync_groups=distributed and getattr(args, 'ddp_sync_groups', False),
@@ -2169,11 +2456,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 print("  Runtime loader config matches planned version.")
         print("Runtime loader config saved.", flush=True)
 
-    # Spatial splitting disabled: estimate_memory_mb overestimates for n_downsample>=6
-    # (~4x), causing unnecessary splits that slow training dramatically. With batch=1
-    # and conservative target_memory_mb, the largest patches (192x192x96) fit in ~22GB.
-    spatial_splits = {}
-
     if is_main:
         print("Setting up validation loader...", flush=True)
     val_loader = MultiResolutionLoader(
@@ -2190,6 +2472,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         min_loader_cases=getattr(args, 'min_loader_cases', 2),
         planned_batch_sizes=planned_batch_sizes,
         planned_val_batch_sizes=planned_val_batch_sizes,
+        planned_patch_sizes_mm=planned_patch_sizes_mm,
     )
     if is_main:
         print("Validation loader ready.", flush=True)
@@ -2243,9 +2526,24 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
 
     # Wrap with DDP
     if distributed:
-        model = DDP(raw_model, device_ids=[local_rank])
+        # find_unused_parameters=True: the model has spacing-conditional
+        # parameter usage (some pyramid / kernel-trim paths are inactive at
+        # certain spacings), so async ranks can activate different subsets of
+        # parameters per step.  Without this the reducer errors with "params
+        # did not receive grad".  Safe memory-wise now that spatial_splits is
+        # removed: no extra backward() calls per step.
+        _ddp_find_unused = not getattr(args, 'ddp_sync_groups', False)
+        model = DDP(
+            raw_model,
+            device_ids=[local_rank],
+            find_unused_parameters=_ddp_find_unused,
+        )
         if is_main:
-            print(f"Model wrapped with DistributedDataParallel", flush=True)
+            print(
+                f"Model wrapped with DistributedDataParallel "
+                f"(find_unused_parameters={_ddp_find_unused})",
+                flush=True,
+            )
 
     # Load pretrained weights if requested (before optimizer, fresh training)
     if args.init_checkpoint:
@@ -2286,7 +2584,12 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
     optimizer = AdamW(raw_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
+    if getattr(args, 'fixed_lr', False):
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        if is_main:
+            print(f"Using fixed learning rate {args.lr}")
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
 
     # Plan validation: compare runtime args against planned config.json
     if is_main:
@@ -2466,6 +2769,10 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
             epoch_peak_bs = 0
             nan_skip_count = 0
             torch.cuda.reset_peak_memory_stats(device)
+            # Many distinct group shapes accumulate cached allocations over
+            # epochs; release unused reserved memory back to CUDA so the
+            # allocator doesn't hold fragmented blocks we can't reuse.
+            torch.cuda.empty_cache()
 
             # Loop termination.  In DDP async mode each rank draws different
             # groups with different batch sizes, so we fix the step count to
@@ -2493,7 +2800,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 images = batch['data'].to(device, dtype=input_dtype)
                 labels = batch['seg'].to(device).long().squeeze(1)  # (B, D, H, W)
                 batch_size = images.shape[0]
-                is_superres = batch.get('is_superres', False)
 
                 # Gradient accumulation for small-batch groups.
                 # Disabled in DDP async mode: ranks process different groups
@@ -2501,16 +2807,12 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 # exactly once per step to avoid deadlocking the all-reduce.
                 if _ddp_async:
                     accum_steps = 1
-                elif not is_superres and batch_size < args.min_batch_size and spacing in train_loader.group_loaders:
+                elif batch_size < args.min_batch_size and spacing in train_loader.group_loaders:
                     accum_steps = math.ceil(args.min_batch_size / batch_size)
                 else:
                     accum_steps = 1
 
-                # Spatial splits for groups that exceed GPU memory
-                # Use canonical group spacing for lookup (actual per-case spacing may differ)
-                group_sp = batch.get('group_spacing', spacing)
-                n_splits = spatial_splits.get(group_sp, 1) if not is_superres else 1
-                total_micro = accum_steps * n_splits
+                total_micro = accum_steps
 
                 optimizer.zero_grad()
                 accum_loss = 0.0
@@ -2521,11 +2823,54 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         images = batch['data'].to(device, dtype=input_dtype)
                         labels = batch['seg'].to(device).long().squeeze(1)
 
-                    # Apply resolution jitter if enabled (shared across splits)
-                    if args.resolution_jitter_sigma > 0:
+                    # Kernel-scale handling.
+                    #
+                    # With use_group_spacing=True AND native_kernel_scale=True,
+                    # the architecture is fixed at the subloader's canonical
+                    # spacing and each batch member's native mm positions are
+                    # fed to the kernel via ``spacing_scale`` — so the SH/RBF
+                    # evaluation reflects the true (off-grid) native, but
+                    # pool cascade, kernel voxel sizes, and per-level shapes
+                    # stay invariant.  Optional resolution jitter then adds
+                    # a small random perturbation on top of that
+                    # native-proportional scale.
+                    #
+                    # With use_group_spacing=True and native_kernel_scale=False
+                    # (legacy default), the kernel sees the canonical
+                    # spacing exactly — resolution_jitter_sigma may still
+                    # add random jitter on top.
+                    #
+                    # Without use_group_spacing, resolution jitter instead
+                    # nudges the input spacing itself (which can trigger an
+                    # architecture rebuild).
+                    spacing_scale = None
+                    use_group_sp = getattr(args, 'use_group_spacing', False)
+                    use_native_kernel = getattr(args, 'native_kernel_scale', False)
+                    if use_group_sp:
+                        if use_native_kernel:
+                            spacing_scale = tuple(
+                                max(0.5, float(n) / float(c))
+                                for n, c in zip(native_sp, spacing)
+                            )
+                        if args.resolution_jitter_sigma > 0:
+                            jitter = np.random.normal(
+                                0, args.resolution_jitter_sigma, 3)
+                            if spacing_scale is None:
+                                spacing_scale = tuple(
+                                    max(0.5, 1.0 + j / s)
+                                    for s, j in zip(spacing, jitter)
+                                )
+                            else:
+                                spacing_scale = tuple(
+                                    max(0.5, r * (1.0 + j))
+                                    for r, j in zip(spacing_scale, jitter)
+                                )
+                        jittered_spacing = spacing  # canonical
+                    elif args.resolution_jitter_sigma > 0:
                         jitter = np.random.normal(0, args.resolution_jitter_sigma, 3)
-                        jittered_spacing = tuple(s + j for s, j in zip(spacing, jitter))
-                        jittered_spacing = tuple(max(0.1, s) for s in jittered_spacing)
+                        jittered_spacing = tuple(
+                            max(0.1, s + j) for s, j in zip(spacing, jitter)
+                        )
                     else:
                         jittered_spacing = spacing
 
@@ -2535,7 +2880,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         'batch_size': batch_size
                     })
 
-                    # Apply scale jitter if enabled (shared across splits)
+                    # Apply scale jitter if enabled
                     if args.scale_jitter_std > 0:
                         base_scales = [model.scale * (2 ** i) for i in range(model.n_downsample)]
                         jittered_scales = [
@@ -2545,88 +2890,27 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                     else:
                         jittered_scales = None
 
-                    # Split images/labels spatially if needed
-                    if n_splits > 1:
-                        # Distribute splits across dimensions, ensuring no dim
-                        # goes below min_dim (needed for n_downsample pooling levels)
-                        min_dim = 2 ** args.n_downsample  # e.g. 64 for n_downsample=6
-                        spatial = list(images.shape[2:])  # [D, H, W]
-                        splits_per_dim = [1, 1, 1]
-                        remaining = n_splits
-                        while remaining > 1:
-                            # Find largest dimension that can still be split
-                            best_dim = -1
-                            best_size = 0
-                            for d in range(3):
-                                chunk_size = spatial[d] // splits_per_dim[d]
-                                if chunk_size // 2 >= min_dim and chunk_size > best_size:
-                                    best_dim = d
-                                    best_size = chunk_size
-                            if best_dim < 0:
-                                break  # can't split further without going below min
-                            splits_per_dim[best_dim] *= 2
-                            remaining //= 2
-
-                        total_chunks = splits_per_dim[0] * splits_per_dim[1] * splits_per_dim[2]
-                        if total_chunks > 1:
-                            # Multi-dim chunking: split sequentially per dim
-                            img_chunks_list = [images]
-                            lbl_chunks_list = [labels]
-                            for d in range(3):
-                                if splits_per_dim[d] > 1:
-                                    new_img = []
-                                    new_lbl = []
-                                    for ic in img_chunks_list:
-                                        new_img.extend(torch.chunk(ic, splits_per_dim[d], dim=d+2))
-                                    for lc in lbl_chunks_list:
-                                        new_lbl.extend(torch.chunk(lc, splits_per_dim[d], dim=d+1))
-                                    img_chunks_list = new_img
-                                    lbl_chunks_list = new_lbl
-                            image_chunks = img_chunks_list
-                            label_chunks = lbl_chunks_list
-                            # Update n_splits/total_micro to reflect actual chunk count
-                            n_splits = len(image_chunks)
-                            total_micro = accum_steps * n_splits
+                    # Forward pass
+                    with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                        if args.deep_supervision:
+                            outputs = model(images, spacing=jittered_spacing,
+                                            scales=jittered_scales, spacing_scale=spacing_scale)
+                            # Filter out outputs with 0-size spatial dims
+                            # (can happen with very deep networks on small patches)
+                            valid_outputs = [o for o in outputs if all(s > 0 for s in o.shape[2:])]
+                            output_shapes = [out.shape[2:] for out in valid_outputs]
+                            multi_scale_labels = downsample_seg_for_deep_supervision(
+                                labels, output_shapes=output_shapes
+                            )
+                            loss = criterion(valid_outputs, multi_scale_labels)
                         else:
-                            image_chunks = [images]
-                            label_chunks = [labels]
-                            n_splits = 1
-                            total_micro = accum_steps
-                    else:
-                        image_chunks = [images]
-                        label_chunks = [labels]
+                            outputs = model(images, spacing=jittered_spacing,
+                                            scales=jittered_scales, spacing_scale=spacing_scale)
+                            loss = criterion(outputs, labels)
 
-                    for img_chunk, lbl_chunk in zip(image_chunks, label_chunks):
-                        # Forward pass
-                        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                            if is_superres:
-                                orig_spacing = tuple(batch['orig_spacings'][0])
-                                outputs = raw_model.forward_superres(
-                                    img_chunk, sub_spacing=jittered_spacing, orig_spacing=orig_spacing
-                                )
-                                if outputs.shape[2:] != lbl_chunk.shape[1:]:
-                                    outputs = nn.functional.interpolate(
-                                        outputs, size=lbl_chunk.shape[1:],
-                                        mode='trilinear', align_corners=True
-                                    )
-                                loss = base_criterion(outputs, lbl_chunk)
-                            elif args.deep_supervision:
-                                outputs = model(img_chunk, spacing=jittered_spacing, scales=jittered_scales)
-                                # Filter out outputs with 0-size spatial dims
-                                # (can happen with spatial splitting + deep networks)
-                                valid_outputs = [o for o in outputs if all(s > 0 for s in o.shape[2:])]
-                                output_shapes = [out.shape[2:] for out in valid_outputs]
-                                multi_scale_labels = downsample_seg_for_deep_supervision(
-                                    lbl_chunk, output_shapes=output_shapes
-                                )
-                                loss = criterion(valid_outputs, multi_scale_labels)
-                            else:
-                                outputs = model(img_chunk, spacing=jittered_spacing, scales=jittered_scales)
-                                loss = criterion(outputs, lbl_chunk)
-
-                        # Backward pass with loss scaled by total micro-batches
-                        (loss / total_micro).backward()
-                        accum_loss += loss.item()
+                    # Backward pass with loss scaled by accum steps
+                    (loss / total_micro).backward()
+                    accum_loss += loss.item()
 
                     n_train_patches += batch_size
 
@@ -2659,7 +2943,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         f"spacing={tuple(f'{s:.3f}' for s in spacing)} "
                         f"group_spacing={tuple(f'{s:.3f}' for s in batch.get('group_spacing', spacing))} "
                         f"patch={tuple(images.shape[2:])} bs={batch_size} "
-                        f"is_superres={is_superres} "
                         f"bad_local={bad_local}",
                         flush=True,
                     )
@@ -2736,7 +3019,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 # Legacy: sample proportionally by weight
                 group_iter = None
 
-            def _val_forward(images, labels, spacing):
+            def _val_forward(images, labels, spacing, spacing_scale=None):
                 """Run val forward on images, handling max_val_batch_size slicing."""
                 all_preds = []
                 total_loss = 0.0
@@ -2748,10 +3031,16 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                     sub_img = images[start:end]
                     sub_lbl = labels[start:end]
                     with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                        out = raw_model(sub_img, spacing=spacing)
+                        out = raw_model(sub_img, spacing=spacing, spacing_scale=spacing_scale)
                         if args.deep_supervision:
-                            total_loss += criterion(out, downsample_seg_for_deep_supervision(sub_lbl, [o.shape[2:] for o in out])).item()
-                            out = out[-1]
+                            # Mirror the training loop: drop 0-size spatial
+                            # levels before computing multi-scale targets.
+                            valid_out = [o for o in out if all(s > 0 for s in o.shape[2:])]
+                            multi_scale_labels = downsample_seg_for_deep_supervision(
+                                sub_lbl, [o.shape[2:] for o in valid_out]
+                            )
+                            total_loss += criterion(valid_out, multi_scale_labels).item()
+                            out = valid_out[-1]
                         else:
                             total_loss += base_criterion(out, sub_lbl).item()
                     all_preds.append(out.argmax(dim=1))
@@ -2759,6 +3048,10 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 return torch.cat(all_preds, dim=0), total_loss / n_sub
 
             if group_iter is not None:
+                _use_native_kernel_val = (
+                    getattr(args, 'use_group_spacing', False)
+                    and getattr(args, 'native_kernel_scale', False)
+                )
                 for spacing, loader in group_iter:
                     group_patches = 0
                     while group_patches < val_patches_per_group:
@@ -2769,7 +3062,17 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                         labels = batch['seg'].to(device).long().squeeze(1)
                         batch_size = images.shape[0]
 
-                        preds, val_batch_loss = _val_forward(images, labels, spacing)
+                        val_spacing_scale = None
+                        if _use_native_kernel_val and 'spacings' in batch and len(batch['spacings']) > 0:
+                            idx = int(np.random.randint(len(batch['spacings'])))
+                            native_sp_val = tuple(float(s) for s in batch['spacings'][idx])
+                            val_spacing_scale = tuple(
+                                max(0.5, n / float(c))
+                                for n, c in zip(native_sp_val, spacing)
+                            )
+
+                        preds, val_batch_loss = _val_forward(images, labels, spacing,
+                                                             spacing_scale=val_spacing_scale)
                         val_loss += val_batch_loss
                         n_val_batches += 1
 
@@ -2808,16 +3111,26 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 while n_val_patches < args.val_patches:
                     batch, spacing = next(val_loader)
 
-                    # Override with group spacing if requested
+                    # Override with group spacing if requested; pass
+                    # native-proportional kernel scale if native_kernel_scale
+                    # is set (matches training-time kernel sampling).
+                    val_spacing_scale = None
                     if getattr(args, 'use_group_spacing', False):
+                        native_sp_val = spacing
                         spacing = batch.get('group_spacing', spacing)
+                        if getattr(args, 'native_kernel_scale', False):
+                            val_spacing_scale = tuple(
+                                max(0.5, float(n) / float(c))
+                                for n, c in zip(native_sp_val, spacing)
+                            )
 
                     input_dtype = amp_dtype
                     images = batch['data'].to(device, dtype=input_dtype)
                     labels = batch['seg'].to(device).long().squeeze(1)
                     batch_size = images.shape[0]
 
-                    preds, val_batch_loss = _val_forward(images, labels, spacing)
+                    preds, val_batch_loss = _val_forward(images, labels, spacing,
+                                                         spacing_scale=val_spacing_scale)
                     val_loss += val_batch_loss
                     n_val_batches += 1
 
@@ -2872,96 +3185,18 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         else:
             ema_pseudo_dice = val_dice
 
-        # Super-resolution validation (separate dice for SR task)
-        sr_val_dice = None
-        sr_group_stats = {}  # Per-group TP/FP/FN for breakdown logging
-        if train_loader.superres_loaders:
-            sr_tp = [0] * (n_classes - 1)
-            sr_fp = [0] * (n_classes - 1)
-            sr_fn = [0] * (n_classes - 1)
-            sr_patches = 0
-            sr_target = max(20, args.val_patches // 5)
-            with torch.no_grad():
-                sr_keys = list(train_loader.superres_loaders.keys())
-                patches_per_key = max(1, sr_target // len(sr_keys))
-                for sr_key in sr_keys:
-                    sr_loader = train_loader.superres_loaders[sr_key]
-                    # Per-group accumulators
-                    g_tp = [0] * (n_classes - 1)
-                    g_fp = [0] * (n_classes - 1)
-                    g_fn = [0] * (n_classes - 1)
-                    g_n = 0
-                    for _ in range(patches_per_key):
-                        sr_batch = next(sr_loader)
-                        input_dtype = amp_dtype
-                        sr_images = sr_batch['data'].to(device, dtype=input_dtype)
-                        sr_labels = sr_batch['seg'].to(device).long().squeeze(1)
-                        sr_spacing = tuple(sr_batch['spacings'][0])
-                        sr_orig_spacing = tuple(sr_batch['orig_spacings'][0])
-
-                        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                            sr_outputs = raw_model.forward_superres(
-                                sr_images, sub_spacing=sr_spacing, orig_spacing=sr_orig_spacing
-                            )
-                            if sr_outputs.shape[2:] != sr_labels.shape[1:]:
-                                sr_outputs = nn.functional.interpolate(
-                                    sr_outputs, size=sr_labels.shape[1:],
-                                    mode='trilinear', align_corners=True
-                                )
-
-                        sr_preds = sr_outputs.argmax(dim=1)
-                        for c in range(1, n_classes):
-                            pred_c = (sr_preds == c)
-                            label_c = (sr_labels == c)
-                            tp_val = (pred_c & label_c).sum().item()
-                            fp_val = (pred_c & ~label_c).sum().item()
-                            fn_val = (~pred_c & label_c).sum().item()
-                            sr_tp[c - 1] += tp_val
-                            sr_fp[c - 1] += fp_val
-                            sr_fn[c - 1] += fn_val
-                            g_tp[c - 1] += tp_val
-                            g_fp[c - 1] += fp_val
-                            g_fn[c - 1] += fn_val
-                        sr_patches += 1
-                        g_n += 1
-
-                    # Compute per-group dice
-                    g_dice_vals = []
-                    for c in range(n_classes - 1):
-                        denom = 2 * g_tp[c] + g_fp[c] + g_fn[c]
-                        if denom > 0:
-                            g_dice_vals.append(2 * g_tp[c] / denom)
-                    g_dice = np.mean(g_dice_vals) if g_dice_vals else 0.0
-                    # Build readable key: sub_sp -> orig_sp
-                    if isinstance(sr_key, tuple) and len(sr_key) == 3 and sr_key[0] == 'superres':
-                        sub_sp = sr_key[1]
-                        orig_sp = sr_key[2]
-                        label = (f"({sub_sp[0]:.2f},{sub_sp[1]:.2f},{sub_sp[2]:.2f})"
-                                 f" -> ({orig_sp[0]:.2f},{orig_sp[1]:.2f},{orig_sp[2]:.2f})")
-                    else:
-                        label = str(sr_key)
-                    sr_group_stats[label] = {'dice': g_dice, 'n': g_n}
-
-            sr_dice_per_class = []
-            for c in range(n_classes - 1):
-                denom = 2 * sr_tp[c] + sr_fp[c] + sr_fn[c]
-                if denom > 0:
-                    sr_dice_per_class.append(2 * sr_tp[c] / denom)
-            sr_val_dice = np.mean(sr_dice_per_class) if sr_dice_per_class else 0.0
-
         epoch_time = time.time() - epoch_start
         lr = scheduler.get_last_lr()[0]
 
-        sr_str = f" | sr_dice: {sr_val_dice:.4f}" if sr_val_dice is not None else ""
         if is_baseline:
             log_msg = (f"Epoch {epoch:4d} | BASELINE (pretrained) | val_loss: {val_loss:.4f} "
-                       f"| pseudo_dice: {val_dice:.4f} | ema_dice: {ema_pseudo_dice:.4f}{sr_str} "
+                       f"| pseudo_dice: {val_dice:.4f} | ema_dice: {ema_pseudo_dice:.4f} "
                        f"| time: {epoch_time:.1f}s")
         else:
             mem_str = f" | peak_mem: {epoch_peak_mb:.0f}MB" if epoch_peak_mb > 0 else ""
             nan_str = f" | nan_skips: {nan_skip_count}" if nan_skip_count > 0 else ""
             log_msg = (f"Epoch {epoch:4d} | loss: {train_loss:.4f} | val_loss: {val_loss:.4f} "
-                       f"| pseudo_dice: {val_dice:.4f} | ema_dice: {ema_pseudo_dice:.4f}{sr_str} "
+                       f"| pseudo_dice: {val_dice:.4f} | ema_dice: {ema_pseudo_dice:.4f} "
                        f"| lr: {lr:.2e}{mem_str}{nan_str} | time: {epoch_time:.1f}s")
         print(log_msg)
         log_file.write(log_msg + '\n')
@@ -2986,8 +3221,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
             }
             if epoch_peak_mb > 0:
                 wandb_metrics['peak_memory_mb'] = epoch_peak_mb
-            if sr_val_dice is not None:
-                wandb_metrics['sr_dice'] = sr_val_dice
             wandb_run.log(wandb_metrics, step=epoch)
 
         # Structured JSON log entry
@@ -3002,8 +3235,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         }
         if epoch_peak_mb > 0:
             epoch_log['peak_memory_mb'] = epoch_peak_mb
-        if sr_val_dice is not None:
-            epoch_log['sr_dice'] = sr_val_dice
         json_log.append(epoch_log)
         with open(json_log_path, 'w') as f:
             json.dump(json_log, f, indent=1)
@@ -3054,16 +3285,6 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
             epoch_log['group_dice'] = group_dice_log
             with open(json_log_path, 'w') as f:
                 json.dump(json_log, f, indent=1)
-
-            # SR dice by resolution group
-            if sr_group_stats:
-                print(f'  SR dice by resolution group (epoch {epoch}):')
-                log_file.write(f'  SR dice by resolution group (epoch {epoch}):\n')
-                for label in sorted(sr_group_stats.keys()):
-                    stats = sr_group_stats[label]
-                    print(f'    {label}: {stats["dice"]:.4f} (n={stats["n"]})')
-                    log_file.write(f'    {label}: {stats["dice"]:.4f} (n={stats["n"]})\n')
-                log_file.flush()
 
             plot_resolution_density(all_train_resolutions, last_val_resolutions, output_dir, epoch)
 
@@ -3218,11 +3439,13 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['val_target_memory_mb'] = training.get('val_target_memory_mb', 0)
     args_dict['min_batch_size'] = training['min_batch_size']
     args_dict['max_batch_size'] = training['max_batch_size']
+    args_dict['min_bottleneck_voxels'] = training.get('min_bottleneck_voxels', 1)
     args_dict['pooling_factor'] = training['pooling_factor']
     args_dict['resolution_jitter_sigma'] = training['resolution_jitter_sigma']
     args_dict['scale_jitter_std'] = training.get('scale_jitter_std', 0.0)
     args_dict['num_workers'] = training['num_workers']
     args_dict['lr'] = args_dict.pop('learning_rate')
+    args_dict['fixed_lr'] = training.get('fixed_lr', False)
 
     # Augmentation arguments
     aug = config['augmentation']
@@ -3233,15 +3456,17 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['max_inplane_spacing'] = aug.get('max_inplane_spacing', 0.0)
     args_dict['min_slice_thickness'] = aug.get('min_slice_thickness', 0.0)
     args_dict['max_slice_thickness'] = aug.get('max_slice_thickness', 0.0)
+    args_dict['spacing_grid_values'] = aug.get('spacing_grid', None)
     args_dict['min_loader_cases'] = aug.get('min_loader_cases', 2)
-    args_dict['superres_training'] = aug.get('superres_training', False)
-    args_dict['superres_weight'] = aug.get('superres_weight', 0.1)
-    args_dict['group_balance'] = aug.get('group_balance', 0.0)
+    args_dict['sampling_temperature'] = aug.get('sampling_temperature', 1.0)
+    args_dict['mixed_group_real_floor'] = aug.get('mixed_group_real_floor', 0.25)
+    args_dict['dual_assign_ambiguous'] = aug.get('dual_assign_ambiguous', False)
     args_dict['bias_field'] = aug.get('bias_field', True)
     args_dict['curriculum'] = aug.get('curriculum', None)
     args_dict['curriculum_bs_tiers'] = aug.get('curriculum_bs_tiers', None)
     args_dict['curriculum_phase_len'] = aug.get('curriculum_phase_len', 30)
     args_dict['use_group_spacing'] = aug.get('use_group_spacing', False)
+    args_dict['native_kernel_scale'] = aug.get('native_kernel_scale', False)
 
     # Hardware arguments
     hw = config['hardware']
@@ -3367,8 +3592,15 @@ def main():
                                  'GPU batch size accumulate gradients to reach this.')
     train_group.add_argument('--max_batch_size', type=int, default=24,
                             help='Maximum batch size for dynamic sizing (default: 32)')
+    train_group.add_argument('--min_bottleneck_voxels', type=int, default=1,
+                            help='Lower bound (in bottleneck voxels per axis) when per-group '
+                                 'patch shrinking is allowed to reduce memory.  1 = patch may '
+                                 'collapse to a single bottleneck voxel per axis.  Default 1.')
     train_group.add_argument('--lr', type=float, default=0.01,
                             help='Learning rate (default: 0.01)')
+    train_group.add_argument('--fixed_lr', action='store_true',
+                            help='Use a fixed learning rate (no scheduler decay). '
+                                 'Default is cosine annealing from --lr to 1e-7.')
     train_group.add_argument('--weight_decay', type=float, default=3e-5,
                             help='Weight decay (default: 3e-5)')
     train_group.add_argument('--grad_clip', type=float, default=12.0,
@@ -3390,9 +3622,14 @@ def main():
     train_group.add_argument('--subsample_weight', type=float, default=0.0,
                             help='Weight for preprocessed subsampled data (default: 0.0, disabled). '
                                  'Use preprocess.py subsample to create subsampled versions first.')
-    train_group.add_argument('--group_balance', type=float, default=0.0,
-                            help='Balance sampling across resolution groups (default: 0.0). '
-                                 '0=proportional to case count, 1=uniform across groups.')
+    train_group.add_argument('--sampling_temperature', type=float, default=1.0,
+                            help='Temperature applied to resolution-group sampling weights '
+                                 '(default: 1.0). w <- w^t before renormalising. '
+                                 't=1 proportional to case count, t<1 flattens, t=0 uniform.')
+    train_group.add_argument('--mixed_group_real_floor', type=float, default=0.25,
+                            help='Within mixed (orig+sub) groups, floor the combined sampling '
+                                 'probability of original cases at this value (default: 0.25). '
+                                 'Leaves pure-orig/pure-sub groups uniform.')
     train_group.add_argument('--curriculum', type=int, nargs='+', default=None, metavar='EPOCH',
                             help='Staged resolution introduction at these epoch boundaries. '
                                  'E.g., --curriculum 10 20 30 introduces groups in 4 stages: '
@@ -3407,11 +3644,6 @@ def main():
                                  'onboards coarse-to-fine resolution groups over 5 phases.')
     train_group.add_argument('--curriculum_phase_len', type=int, default=30,
                             help='Epochs per phase for --curriculum_bs_tiers (default: 30)')
-    train_group.add_argument('--superres_training', action='store_true',
-                            help='Enable super-resolution training: model receives low-res input, '
-                                 'produces high-res output using original-resolution labels')
-    train_group.add_argument('--superres_weight', type=float, default=0.1,
-                            help='Sampling weight for super-resolution batches (default: 0.1)')
     train_group.add_argument('--min_spacing', type=float, default=0.0,
                             help='Exclude cases with finest spacing below this value in mm (default: 0.0, include all)')
     train_group.add_argument('--max_inplane_spacing', type=float, default=0.0,
@@ -3420,6 +3652,11 @@ def main():
                             help='Exclude cases with slice thickness below this value in mm (default: 0.0, include all)')
     train_group.add_argument('--max_slice_thickness', type=float, default=0.0,
                             help='Exclude cases with slice thickness above this value in mm (default: 0.0, include all)')
+    train_group.add_argument('--spacing_grid', type=str, default=None,
+                            help='Override irrepunet.data.spacing.SPACING_GRID with a comma-separated '
+                                 'list of mm values (e.g. "0.2,0.25,...,1.5,2.0,...,6.0"). '
+                                 'Applied before planning / grouping so loader groups track the new grid. '
+                                 'Persisted to config.json as augmentation.spacing_grid.')
     train_group.add_argument('--min_loader_cases', type=int, default=2,
                             help='Minimum cases per loader group (groups with fewer cases are skipped)')
     train_group.add_argument('--pooling_factor', type=int, default=8,
@@ -3430,7 +3667,7 @@ def main():
                             help='Std dev of multiplicative Gaussian jitter applied to pooling scales '
                                  '(default: 0.0, disabled). Smooths architecture boundaries. '
                                  'Recommended: 0.05 (5%% jitter).')
-    train_group.add_argument('--num_workers', type=int, default=1,
+    train_group.add_argument('--num_workers', type=int, default=4,
                             help='Number of dataloader workers per resolution group (default: 1)')
     train_group.add_argument('--resume', action='store_true',
                             help='Resume from checkpoint')
@@ -3456,6 +3693,17 @@ def main():
     aug_group.add_argument('--use_group_spacing', action='store_true',
                           help='Use canonical group spacing for model instead of per-case native spacing. '
                                'Replicates JAX JIT behavior for controlled comparison.')
+    aug_group.add_argument('--native_kernel_scale', action='store_true',
+                          help='With --use_group_spacing, keep the architecture at the canonical spacing '
+                               'but let the kernel (SH/RBF) see each batch member\'s native mm positions via '
+                               'spacing_scale. Architecture stays invariant per subloader; kernel sampling '
+                               'follows the actual native spacing distribution. No effect without '
+                               '--use_group_spacing.')
+    aug_group.add_argument('--dual_assign_ambiguous', action='store_true',
+                          help='Assign cases whose native in-plane or slice-thickness sits near the midpoint '
+                               'of its bracketing grid cell to BOTH adjacent canonicals. Cleanly samples '
+                               'borderline cases under either interpretation — mirrors inference-time '
+                               'spacing_ensemble semantics on the training side. No GPU profiling needed.')
     aug_group.add_argument('--no_background_dice', action='store_true',
                           help='Exclude background class from Dice loss (foreground only)')
     aug_group.add_argument('--batch_dice', action='store_true',
@@ -3487,6 +3735,22 @@ def main():
                              help='W&B run name (default: output_dir basename)')
 
     args = parser.parse_args()
+
+    # Parse and apply --spacing_grid override before any planning / grouping
+    # work consults ``irrepunet.data.spacing.SPACING_GRID``.
+    raw_grid = getattr(args, 'spacing_grid', None)
+    if raw_grid:
+        try:
+            grid_values = [float(x) for x in raw_grid.split(',') if x.strip()]
+        except ValueError as e:
+            print(f"Error parsing --spacing_grid: {e}", file=sys.stderr)
+            sys.exit(1)
+        from irrepunet.data import spacing as _spacing_mod
+        _spacing_mod.set_spacing_grid(grid_values)
+        args.spacing_grid_values = list(_spacing_mod.SPACING_GRID)
+        print(f"Overriding SPACING_GRID: {args.spacing_grid_values}")
+    else:
+        args.spacing_grid_values = None
 
     # Resolve sc_mode from --sequential_sc legacy flag
     if getattr(args, 'sc_mode', None) is None:
@@ -3525,6 +3789,7 @@ def main():
     config_hash = None
     planned_batch_sizes = None
     planned_val_batch_sizes = None
+    planned_patch_sizes_mm = None
 
     if args.config:
         print(f"Loading experiment configuration from {args.config}")
@@ -3544,6 +3809,11 @@ def main():
         cli_wandb_project = getattr(args, 'wandb_project', 'irrepunet')
         cli_wandb_name = getattr(args, 'wandb_name', None)
         args = args_from_config(config, config_path=config_path, cli_resume=cli_resume)
+        # Apply spacing_grid from config (if set) before downstream work runs.
+        if getattr(args, 'spacing_grid_values', None):
+            from irrepunet.data import spacing as _spacing_mod
+            _spacing_mod.set_spacing_grid(args.spacing_grid_values)
+            print(f"Applied SPACING_GRID from config: {list(_spacing_mod.SPACING_GRID)}")
         # CLI W&B flags override config (allow enabling W&B without editing config)
         if cli_wandb:
             args.wandb = True
@@ -3551,18 +3821,35 @@ def main():
             if cli_wandb_name:
                 args.wandb_name = cli_wandb_name
 
-        # Extract planned batch sizes from loader_groups
+        # Extract planned batch sizes and per-group patch sizes from loader_groups
         planned_val_batch_sizes = {}
+        planned_patch_sizes_mm = {}
+        global_patch_mm = tuple(float(p) for p in config['training']['patch_size_mm'])
         if 'loader_groups' in config:
             planned_batch_sizes = {}
+            n_val_only = 0
             for group in config['loader_groups']:
                 spacing_key = tuple(float(s) for s in group['spacing'])
-                planned_batch_sizes[spacing_key] = group['batch_size']
+                bs = group['batch_size']
+                if bs > 0:
+                    planned_batch_sizes[spacing_key] = bs
+                else:
+                    n_val_only += 1
                 if 'val_batch_size' in group:
                     planned_val_batch_sizes[spacing_key] = group['val_batch_size']
+                # Per-group patch size — only record if it differs from global
+                if 'patch_size_mm' in group:
+                    g_mm = tuple(float(p) for p in group['patch_size_mm'])
+                    if g_mm != global_patch_mm:
+                        planned_patch_sizes_mm[spacing_key] = g_mm
+            shrunk_n = len(planned_patch_sizes_mm)
             print(f"Loaded planned batch sizes for {len(planned_batch_sizes)} spacing groups"
                   + (f" (+ {len(planned_val_batch_sizes)} val-specific)"
-                     if planned_val_batch_sizes else ""))
+                     if planned_val_batch_sizes else "")
+                  + (f" ({shrunk_n} groups with shrunk patch_size_mm)"
+                     if shrunk_n else "")
+                  + (f" ({n_val_only} val-only groups)"
+                     if n_val_only else ""))
 
         print(f"Configuration loaded successfully")
     else:
@@ -3575,7 +3862,8 @@ def main():
             sys.exit(1)
 
     train(args, config_hash=config_hash, planned_batch_sizes=planned_batch_sizes,
-          planned_val_batch_sizes=planned_val_batch_sizes)
+          planned_val_batch_sizes=planned_val_batch_sizes,
+          planned_patch_sizes_mm=planned_patch_sizes_mm)
 
 
 if __name__ == '__main__':

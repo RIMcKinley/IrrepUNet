@@ -1240,11 +1240,16 @@ def _collect_conv_pairs(projected, original):
 def _update_weights_walk(
     projected: nn.Module,
     original: nn.Module,
+    spacing_scale: Optional[Tuple[float, float, float]] = None,
 ) -> None:
     """Update Conv3d/Conv2d weights in projected model from original.
 
     Precomputes all kernels in parallel using threads, then copies them
-    into the projected model's convolution weights.
+    into the projected model's convolution weights.  If *spacing_scale* is
+    given, each e3nn conv's ``kernel()`` is called with that scale, so the
+    lattice positions are jittered only for the SH/RBF evaluation — the
+    integer kernel grid, pool cascade, and overall architecture remain
+    unchanged.
     """
     pairs = _collect_conv_pairs(projected, original)
 
@@ -1254,7 +1259,7 @@ def _update_weights_walk(
     # Compute all kernels in parallel
     def compute_kernel(conv_o):
         with torch.no_grad():
-            return conv_o.kernel()
+            return conv_o.kernel(spacing_scale=spacing_scale)
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(compute_kernel, conv_o): (conv_p, conv_o)
@@ -1339,6 +1344,52 @@ def update_projected_weights(
 
     projected.default_spacing = new_spacing
     projected._current_spacing = new_spacing
+
+
+def jitter_projected_kernels(
+    projected: nn.Module,
+    model: nn.Module,
+    spacing_scale: Tuple[float, float, float],
+) -> None:
+    """Recompute projected kernels with a jittered spacing, no arch change.
+
+    Unlike :func:`update_projected_weights`, ``projected``'s architecture
+    (pool cascade, per-level voxel counts, integer kernel sizes) is NOT
+    rebuilt.  Only the SH / RBF evaluation inside each conv's
+    ``kernel()`` sees the jittered lattice positions, producing a small
+    perturbation of the convolution weights suitable for inference-time
+    TTA.  Jitter magnitudes that would cross an architecture-equivalence
+    boundary if passed through ``update_projected_weights`` are safe here
+    because ``projected`` is never rebuilt.
+
+    The original ``model`` *is* temporarily put at
+    ``projected._current_spacing`` (unjittered) so its per-level
+    lattices match the projected model's shapes; otherwise the kernels
+    returned by ``model.conv.kernel(spacing_scale=...)`` would be at
+    whatever spacing ``model`` was last configured for, with shapes
+    that do not match ``projected``'s Conv3d weight tensors.
+
+    Parameters
+    ----------
+    projected : nn.Module
+        A previously projected model from :func:`project_to_spacing`.
+    model : nn.Module
+        The original equivariant model (E3nnUNet).
+    spacing_scale : tuple of float
+        Per-axis scale, e.g. ``(1.03, 0.98, 1.00)`` for ~3% in-plane and
+        ~2% slice-thickness jitter.
+    """
+    spacing_scale = tuple(float(s) for s in spacing_scale)
+    old_spacing = model._current_spacing
+    target_spacing = projected._current_spacing
+    rebuilt = old_spacing != target_spacing
+    if rebuilt:
+        model._rebuild_for_spacing(target_spacing)
+    try:
+        _update_weights_walk(projected, model, spacing_scale=spacing_scale)
+    finally:
+        if rebuilt:
+            model._rebuild_for_spacing(old_spacing)
 
 
 def compute_kernel_sizes(

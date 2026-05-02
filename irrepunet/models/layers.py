@@ -478,6 +478,9 @@ class VoxelConvolution(nn.Module):
             **tp_kwargs
         )
 
+        # Transient spacing scale for kernel weight jitter (set by E3nnUNet.forward)
+        self._spacing_scale = None
+
         # Learnable weights
         self.weight = nn.Parameter(torch.randn(self.num_radial_basis, self.tp.weight_numel))
 
@@ -554,14 +557,46 @@ class VoxelConvolution(nn.Module):
         """Update lattice buffers for new spacing without changing learnable params."""
         self._build_lattice_buffers(steps)
 
-    def kernel(self):
-        """Compute the convolution kernel."""
-        weight = self.emb @ self.weight
-        if self.sphere_norm:
-            weight = weight / self._n_kernel_voxels()
+    def kernel(self, spacing_scale=None):
+        """Compute the convolution kernel.
+
+        Parameters
+        ----------
+        spacing_scale : tuple of 3 floats, optional
+            Per-axis multiplicative jitter applied to the lattice positions
+            before recomputing SH and RBF.  The integer grid (kernel voxel
+            size) stays the same — only the physical positions change, so
+            the kernel weights vary without altering the computational
+            graph.  Use for spacing-jitter augmentation that doesn't
+            affect kernel sizes or pooling.
+        """
+        if spacing_scale is not None:
+            # Recompute SH and RBF with jittered lattice positions
+            scale = self.lattice.new_tensor(spacing_scale)
+            jittered = self.lattice * scale
+            emb = soft_one_hot_linspace(
+                x=jittered.float().norm(dim=-1),
+                start=0.0, end=self.diameter / 2,
+                number=self.num_radial_basis,
+                basis='smooth_finite', cutoff=self.cutoff,
+            ).to(dtype=self.emb.dtype)
+            sh = o3.spherical_harmonics(
+                l=self.irreps_sh, x=jittered.float(),
+                normalize=True, normalization='component',
+            ).to(dtype=self.sh.dtype)
+            weight = emb @ self.weight
+            if self.sphere_norm:
+                weight = weight / self._n_kernel_voxels()
+            else:
+                weight = weight / (sh.shape[0] * sh.shape[1] * sh.shape[2])
+            kernel = self.tp.right(sh, weight)
         else:
-            weight = weight / (self.sh.shape[0] * self.sh.shape[1] * self.sh.shape[2])
-        kernel = self.tp.right(self.sh, weight)
+            weight = self.emb @ self.weight
+            if self.sphere_norm:
+                weight = weight / self._n_kernel_voxels()
+            else:
+                weight = weight / (self.sh.shape[0] * self.sh.shape[1] * self.sh.shape[2])
+            kernel = self.tp.right(self.sh, weight)
         kernel = torch.einsum('xyzio->oixyz', kernel)
         return kernel
 
@@ -603,54 +638,45 @@ class VoxelConvolution(nn.Module):
         # With cutoff=False (sc_mode="none"), center has nonzero RBF so kernel is valid.
         is_1x1x1 = all(s == 1 for s in self.lattice.shape[:3])
 
+        _ss = self._spacing_scale
+
         if self.sc_mode == "none":
             # No self-connection: cutoff=False ensures center weight is nonzero
             if is_1x1x1 and self.cutoff:
-                # Shouldn't happen (sc_mode=none forces cutoff=False), but safety
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
-            return F.conv3d(x, self.kernel(), **self.kwargs)
+            return F.conv3d(x, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "sc_first":
             sc = self.sc(x.transpose(1, 4)).transpose(1, 4)
             if is_1x1x1:
                 return sc
-            return F.conv3d(sc, self.kernel(), **self.kwargs)
+            return F.conv3d(sc, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "sc_first_res":
-            # sc then conv, with residual skip around the conv
             sc = self.sc(x.transpose(1, 4)).transpose(1, 4)
             if is_1x1x1:
                 return sc
-            return sc + F.conv3d(sc, self.kernel(), **self.kwargs)
+            return sc + F.conv3d(sc, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "conv_first":
             if is_1x1x1:
-                # Conv output is zero (RBF=0 at origin), sc(0)=0 (no bias)
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
-            conv_out = F.conv3d(x, self.kernel(), **self.kwargs)
+            conv_out = F.conv3d(x, self.kernel(_ss), **self.kwargs)
             return self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
         elif self.sc_mode == "conv_first_res":
-            # conv then sc, with residual skip around the sc
             if is_1x1x1:
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
-            conv_out = F.conv3d(x, self.kernel(), **self.kwargs)
+            conv_out = F.conv3d(x, self.kernel(_ss), **self.kwargs)
             return conv_out + self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
         else:
             # Parallel: fuse sc weights into kernel center.
-            # Instead of computing sc(x) and conv(x) separately — which
-            # requires two B×C_out×D×H×W tensors alive for the addition —
-            # we add the sc weight matrix to the kernel's center voxel and
-            # run a single conv3d.  Mathematically equivalent because with
-            # cutoff=True the RBF is zero at the origin, so the kernel
-            # center is zero and the sc fills it in.
             sc_w = self._sc_weight_matrix()  # (out_dim, in_dim)
             if is_1x1x1:
-                # Kernel is all zeros. Just apply sc as 1x1x1 conv.
                 return F.conv3d(x, sc_w[:, :, None, None, None], **self.kwargs)
-            kernel = self.kernel()
+            kernel = self.kernel(_ss)
             cx = kernel.shape[2] // 2
             cy = kernel.shape[3] // 2
             cz = kernel.shape[4] // 2
@@ -866,10 +892,15 @@ class PyramidVoxelConvolution(VoxelConvolution):
         ).to(kernel_k.dtype)
         return k_up.reshape(C_in, C_out, *target_shape).permute(2, 3, 4, 0, 1)
 
-    def kernel(self):
+    def kernel(self, spacing_scale=None):
         """Compute the fused pyramid kernel at native resolution.
 
         ``tp.right`` runs **once** on the full native lattice.
+
+        ``spacing_scale`` (3-tuple) rescales the lattice positions only for
+        the SH / RBF evaluation — the integer kernel voxel grid, the
+        pyramid-level strides/slices and the scatter membership are all
+        untouched, so pooling and architecture stay fixed.
         """
         # Clamp K to available logits (spacing changes can increase K
         # beyond the parameter size allocated at __init__).
@@ -877,9 +908,27 @@ class PyramidVoxelConvolution(VoxelConvolution):
         alpha = F.softplus(self.pyramid_logits[:K])
         native_shape = tuple(self.lattice.shape[:3])
 
-        # Single TP evaluation
-        weight = self.emb @ self.weight
-        native_kernel = self.tp.right(self.sh, weight)
+        if spacing_scale is None:
+            weight = self.emb @ self.weight
+            native_kernel = self.tp.right(self.sh, weight)
+        else:
+            # Rescale lattice positions, recompute SH and RBF at the
+            # jittered points.  Integer grid, membership and level
+            # strides/slices stay fixed — only the kernel values shift.
+            scale = self.lattice.new_tensor(spacing_scale)
+            jittered = self.lattice * scale
+            emb = soft_one_hot_linspace(
+                x=jittered.float().norm(dim=-1),
+                start=0.0, end=self.diameter / 2,
+                number=self.num_radial_basis,
+                basis='smooth_finite', cutoff=self.cutoff,
+            ).to(dtype=self.emb.dtype)
+            sh = o3.spherical_harmonics(
+                l=self.irreps_sh, x=jittered.float(),
+                normalize=True, normalization='component',
+            ).to(dtype=self.sh.dtype)
+            weight = emb @ self.weight
+            native_kernel = self.tp.right(sh, weight)
 
         if self.pyramid_mode == "scatter":
             # Dot the per-voxel membership with alpha → per-voxel scalar weight
@@ -2012,35 +2061,4 @@ class Decoder(nn.Module):
         if self.deep_supervision and self.ds_heads is not None:
             # Return list: [coarsest, ..., finest (main output to be added by caller)]
             return x, ds_outputs
-        return x
-
-    def forward_superres(self, x, encoder_features):
-        """Forward pass for super-resolution: interpolate skip connections when
-        spatial dimensions don't match between encoder features and decoder.
-
-        No deep supervision for super-res batches (simplifies implementation).
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Bottleneck features from encoder
-        encoder_features : list of torch.Tensor
-            Encoder features at each level (from finest to coarsest)
-
-        Returns
-        -------
-        torch.Tensor
-            Decoded features at full resolution
-        """
-        for i in range(self.n_blocks):
-            x = self.upsample_ops[i](x)
-            skip = encoder_features[::-1][i + 1]
-            # Interpolate skip if spatial dims don't match decoder
-            if skip.shape[2:] != x.shape[2:]:
-                skip = F.interpolate(
-                    skip, size=x.shape[2:],
-                    mode='trilinear', align_corners=True
-                )
-            x = torch.cat([x, skip], dim=1)
-            x = self.up_blocks[i](x)
         return x

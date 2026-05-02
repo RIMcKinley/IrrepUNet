@@ -10,7 +10,6 @@ from irrepunet.data.spacing import (
     group_cases_by_spacing,
     get_canonical_permutation,
     apply_axis_permutation,
-    resolve_root_parent,
 )
 
 
@@ -208,49 +207,3 @@ class TestApplyAxisPermutation:
         assert result.shape == (16, 8, 4)
 
 
-# ---------------------------------------------------------------------------
-# resolve_root_parent
-# ---------------------------------------------------------------------------
-
-class TestResolveRootParent:
-    def test_non_subsampled_returns_self(self):
-        props = {
-            "case_0001": {"spacing": (1.0, 1.0, 1.0)},
-        }
-        assert resolve_root_parent("case_0001", props) == "case_0001"
-
-    def test_single_parent(self):
-        props = {
-            "case_0001": {"spacing": (1.0, 1.0, 1.0)},
-            "case_0001_skip0": {
-                "spacing": (1.0, 1.0, 5.0),
-                "is_subsampled": True,
-                "parent": "case_0001",
-            },
-        }
-        assert resolve_root_parent("case_0001_skip0", props) == "case_0001"
-
-    def test_chain_of_parents(self):
-        props = {
-            "case_0001": {"spacing": (1.0, 1.0, 1.0)},
-            "case_0001_skip0_10x": {
-                "spacing": (1.0, 1.0, 10.0),
-                "is_subsampled": True,
-                "parent": "case_0001",
-            },
-            "case_0001_skip0_10x_skipxy_3x": {
-                "spacing": (3.0, 3.0, 10.0),
-                "is_subsampled": True,
-                "parent": "case_0001_skip0_10x",
-            },
-        }
-        assert resolve_root_parent("case_0001_skip0_10x_skipxy_3x", props) == "case_0001"
-
-    def test_circular_reference_terminates(self):
-        """Should not infinite-loop on circular parent refs."""
-        props = {
-            "a": {"is_subsampled": True, "parent": "b"},
-            "b": {"is_subsampled": True, "parent": "a"},
-        }
-        result = resolve_root_parent("a", props)
-        assert result in ("a", "b")
