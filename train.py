@@ -1080,14 +1080,15 @@ class ExperimentPlanner:
                 spacing=ref_spacing,
                 normalization=self.args.normalization,
                 n_base_filters=self.args.n_base_filters,
+                n_base_odd=getattr(self.args, 'n_base_odd', None),
                 n_downsample=self.args.n_downsample,
                 equivariance=self.args.equivariance,
-                lmax=len(self.args.irrep_ratios) - 1,
+                lmax=_irrep_lmax(self.args.irrep_ratios),
                 dropout_prob=self.args.dropout,
                 cutoff=True,
                 deep_supervision=self.args.deep_supervision,
                 max_features=self.args.max_features,
-                irrep_ratios=tuple(self.args.irrep_ratios),
+                irrep_ratios=_norm_irrep_ratios(self.args.irrep_ratios),
                 fill_to_max=self.args.fill_to_max,
                 activation=getattr(self.args, 'activation', 'softplus'),
                 kernel_trim_threshold=getattr(self.args, 'kernel_trim_threshold', 1.0),
@@ -1099,6 +1100,7 @@ class ExperimentPlanner:
                 fused_gate=getattr(self.args, 'fused_gate', True),
                 backend=getattr(self.args, 'backend', 'e3nn'),
                 pyramid=_build_pyramid_config(self.args) if getattr(self.args, 'pyramid', None) else False,
+                mask_renorm=getattr(self.args, 'mask_renorm', False),
             )
 
             self._profiled_memory = profile_memory_on_gpu(
@@ -1462,6 +1464,7 @@ class ExperimentPlanner:
 
             "model": {
                 "n_base_filters": self.args.n_base_filters,
+                "n_base_odd": getattr(self.args, 'n_base_odd', None),
                 "n_downsample": self.args.n_downsample,
                 "diameter": self.args.diameter,
                 "num_radial_basis": self.args.num_radial_basis,
@@ -1483,6 +1486,7 @@ class ExperimentPlanner:
                 "backend": getattr(self.args, 'backend', 'e3nn'),
                 "pyramid": getattr(self.args, 'pyramid', None),
                 "pyramid_decay": getattr(self.args, 'pyramid_decay', 1.0),
+                "mask_renorm": getattr(self.args, 'mask_renorm', False),
             },
 
             "training": {
@@ -1939,6 +1943,22 @@ def _build_pyramid_config(args):
     if hasattr(args, 'pyramid_decay') and args.pyramid_decay is not None:
         cfg['pyramid_decay'] = args.pyramid_decay
     return cfg
+
+
+def _norm_irrep_ratios(ratios):
+    """Normalise ratios for E3nnUNet: tuple→tuple, dict→dict (preserving keys)."""
+    if isinstance(ratios, dict):
+        return {k: tuple(v) for k, v in ratios.items()}
+    return tuple(ratios)
+
+
+def _irrep_lmax(ratios):
+    """Infer lmax from either tuple or {'e','o'} dict ratios."""
+    if isinstance(ratios, dict):
+        even = ratios.get('e', ()) or ()
+        odd = ratios.get('o', ()) or ()
+        return max(len(even), len(odd)) - 1
+    return len(ratios) - 1
 
 
 # =============================================================================
@@ -2494,14 +2514,15 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         spacing=ref_spacing,
         normalization=args.normalization,
         n_base_filters=args.n_base_filters,
+        n_base_odd=getattr(args, 'n_base_odd', None),
         n_downsample=args.n_downsample,
         equivariance=args.equivariance,
-        lmax=len(args.irrep_ratios) - 1,
+        lmax=_irrep_lmax(args.irrep_ratios),
         dropout_prob=args.dropout,
         cutoff=True,
         deep_supervision=args.deep_supervision,
         max_features=args.max_features,
-        irrep_ratios=tuple(args.irrep_ratios),
+        irrep_ratios=_norm_irrep_ratios(args.irrep_ratios),
         fill_to_max=args.fill_to_max,
         activation=getattr(args, 'activation', 'softplus'),
         kernel_trim_threshold=getattr(args, 'kernel_trim_threshold', 1.0),
@@ -2514,6 +2535,7 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
         pool_mode=getattr(args, 'pool_mode', 'maxpool3d'),
         backend=getattr(args, 'backend', 'e3nn'),
         pyramid=_build_pyramid_config(args) if getattr(args, 'pyramid', None) else False,
+        mask_renorm=getattr(args, 'mask_renorm', False),
     )
     if is_main:
         print(f"Model built, moving to {device}...", flush=True)
@@ -2801,6 +2823,18 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                 labels = batch['seg'].to(device).long().squeeze(1)  # (B, D, H, W)
                 batch_size = images.shape[0]
 
+                # Optional validity mask (masking / MAE) for the masked-dense
+                # backend. Stays None when no mask source is configured, so
+                # default behaviour is unchanged.
+                mask = None
+                mae_ratio = getattr(args, 'mae_mask_ratio', 0.0)
+                if 'mask' in batch:
+                    mask = batch['mask'].to(device).float().squeeze(1)  # (B,D,H,W)
+                if mae_ratio > 0:
+                    keep = (torch.rand(images.shape[0], *images.shape[2:],
+                                       device=device) >= mae_ratio).float()
+                    mask = keep if mask is None else mask * keep
+
                 # Gradient accumulation for small-batch groups.
                 # Disabled in DDP async mode: ranks process different groups
                 # with different batch sizes, so all must call backward()
@@ -2894,7 +2928,8 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                     with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                         if args.deep_supervision:
                             outputs = model(images, spacing=jittered_spacing,
-                                            scales=jittered_scales, spacing_scale=spacing_scale)
+                                            scales=jittered_scales, spacing_scale=spacing_scale,
+                                            mask=mask)
                             # Filter out outputs with 0-size spatial dims
                             # (can happen with very deep networks on small patches)
                             valid_outputs = [o for o in outputs if all(s > 0 for s in o.shape[2:])]
@@ -2902,16 +2937,24 @@ def train(args, config_hash: str = None, planned_batch_sizes: dict = None,
                             multi_scale_labels = downsample_seg_for_deep_supervision(
                                 labels, output_shapes=output_shapes
                             )
-                            loss = criterion(valid_outputs, multi_scale_labels)
+                            if mask is not None:
+                                # Downsample the mask to each output scale (nearest).
+                                multi_scale_masks = downsample_seg_for_deep_supervision(
+                                    mask, output_shapes=output_shapes
+                                )
+                                loss = criterion(valid_outputs, multi_scale_labels,
+                                                 masks=multi_scale_masks)
+                            else:
+                                loss = criterion(valid_outputs, multi_scale_labels)
                         else:
                             outputs = model(images, spacing=jittered_spacing,
-                                            scales=jittered_scales, spacing_scale=spacing_scale)
-                            loss = criterion(outputs, labels)
+                                            scales=jittered_scales, spacing_scale=spacing_scale,
+                                            mask=mask)
+                            loss = criterion(outputs, labels, mask=mask)
 
                     # Backward pass with loss scaled by accum steps
                     (loss / total_micro).backward()
                     accum_loss += loss.item()
-
                     n_train_patches += batch_size
 
                 if args.grad_clip > 0:
@@ -3395,6 +3438,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     # Model arguments
     model = config['model']
     args_dict['n_base_filters'] = model['n_base_filters']
+    args_dict['n_base_odd'] = model.get('n_base_odd', None)
     args_dict['n_downsample'] = model['n_downsample']
     args_dict['diameter'] = model['diameter']
     args_dict['num_radial_basis'] = model['num_radial_basis']
@@ -3414,6 +3458,7 @@ def args_from_config(config: Dict, config_path: Path = None, cli_resume: bool = 
     args_dict['scale'] = model.get('scale', 2.0)
     args_dict['pool_mode'] = model.get('pool_mode', 'maxpool3d')
     args_dict['backend'] = model.get('backend', 'e3nn')
+    args_dict['mask_renorm'] = model.get('mask_renorm', False)
     args_dict['pyramid'] = model.get('pyramid', None)
     args_dict['pyramid_decay'] = model.get('pyramid_decay', 1.0)
     args_dict['bottleneck_kernel'] = model.get('bottleneck_kernel', 0)
@@ -3507,7 +3552,15 @@ def main():
     # Model arguments
     model_group = parser.add_argument_group('Model')
     model_group.add_argument('--n_base_filters', type=int, default=2,
-                            help='Base number of filters (default: 2)')
+                            help='Base number of filters (default: 2). '
+                                 'Sets even-parity multiplicity (ne); also sets '
+                                 'odd-parity (no) for O3 unless --n_base_odd is given.')
+    model_group.add_argument('--n_base_odd', type=int, default=None,
+                            help='Base number of ODD-parity filters (no) for O3 '
+                                 'equivariance.  Default: same as --n_base_filters. '
+                                 'Set lower than --n_base_filters to add fewer odd-'
+                                 'parity features than even (1.5x feature mix when '
+                                 'n_base_filters=2 and n_base_odd=1).  Ignored for SO3.')
     model_group.add_argument('--n_downsample', type=int, default=4,
                             help='Number of downsampling steps (default: 4)')
     model_group.add_argument('--diameter', type=float, default=5.0,
@@ -3561,7 +3614,19 @@ def main():
                                  'subsequent levels use scale * 2^i. Normally set automatically by --bottleneck_kernel.')
     model_group.add_argument('--backend', type=str, default='e3nn',
                             choices=['e3nn'],
-                            help='Convolution backend (only e3nn is supported).')
+                            help="Convolution backend (only e3nn is supported).")
+    model_group.add_argument('--mae_mask_ratio', type=float, default=0.0,
+                            help="Fraction of input voxels to drop (censor) each "
+                                 "training step for MAE-style pretraining. 0 disables. "
+                                 "Dropped voxels are excluded from both the receptive "
+                                 "field and the loss.")
+    model_group.add_argument('--mask_renorm', action=argparse.BooleanOptionalAction,
+                            default=False,
+                            help="Partial-convolution boundary renormalization: rescale "
+                                 "each output voxel by the valid fraction of its kernel "
+                                 "sphere so boundary activations keep interior magnitude. "
+                                 "Off (default) = pure censoring; on is the usual choice "
+                                 "for MAE.")
     model_group.add_argument('--pyramid', type=str, default=None, nargs='?', const='scatter',
                             choices=['scatter', 'interp'],
                             help='Enable pyramid kernel convolution. Optional mode: scatter (default) or interp.')

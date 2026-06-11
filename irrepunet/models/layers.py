@@ -126,6 +126,91 @@ def _pool_factor(scale, step):
     return max(math.floor(raw), 1)
 
 
+def _masked_instance_norm(norm, x, mask=None):
+    """Vectorized e3nn instance-norm (``component`` / ``reduce='mean'``).
+
+    Replicates ``e3nn.nn.BatchNorm(instance=True)`` exactly, but with no Python
+    loop over the batch, no scatter, and no channel-last transpose — operates
+    channel-first with fp32 reductions.  This is both the masked-dense norm and
+    a leaner drop-in for the plain (no-mask) instance norm.
+
+    ``mask`` (B, 1, *spatial), 1=valid: when given, per-sample statistics are
+    taken over the valid voxels only (masked voxels are normalised with those
+    stats; their values are irrelevant — the next conv re-zeros them).  When
+    ``None``, statistics use every voxel.
+    """
+    B, C = x.shape[0], x.shape[1]
+    spatial = x.shape[2:]
+    P = int(torch.tensor(spatial).prod().item()) if len(spatial) else 1
+    xf = x.reshape(B, C, P)
+    if mask is not None:
+        m = (mask.reshape(B, 1, P) > 0).to(torch.float32)   # (B, 1, P)
+        n = m.sum(2).clamp_min(1.0)                          # (B, 1) valid count
+    comp = norm.normalization == 'component'
+    affine = norm.affine
+    weight = norm.weight.float() if affine else None
+    bias = norm.bias.float() if (affine and norm.include_bias) else None
+
+    blocks = []
+    ix = iw = ib = 0
+    for mul, d, is_scalar in norm.irs:
+        blk = xf[:, ix:ix + mul * d, :].float().reshape(B, mul, d, P)
+        ix += mul * d
+        if is_scalar:
+            if mask is not None:
+                mean = (blk * m.reshape(B, 1, 1, P)).sum(3) / n.reshape(B, 1, 1)
+            else:
+                mean = blk.mean(3)                                            # (B,mul,d)
+            blk = blk - mean.unsqueeze(-1)
+        sq = blk.pow(2).mean(2) if comp else blk.pow(2).sum(2)                 # (B,mul,P)
+        fn = ((sq * m).sum(2) / n) if mask is not None else sq.mean(2)         # (B,mul)
+        fn = (fn + norm.eps).pow(-0.5)
+        if affine:
+            fn = fn * weight[iw:iw + mul]
+            iw += mul
+        blk = blk * fn.reshape(B, mul, 1, 1)
+        if is_scalar and bias is not None:
+            blk = blk + bias[ib:ib + mul].reshape(1, mul, 1, 1)
+            ib += mul
+        blocks.append(blk.reshape(B, mul * d, P))
+    out = torch.cat(blocks, dim=1).to(x.dtype)
+    return out.reshape(B, C, *spatial)
+
+
+def _masked_e3nn_batchnorm(norm, x, mask):
+    """Apply an e3nn ``BatchNorm`` over the valid (mask==1) voxels only.
+
+    The masked-dense analogue of normalising over the active set: masked voxels
+    never enter the mean/variance.  ``x`` is channel-first ``(B, C, *spatial)``;
+    ``mask`` is ``(B, 1, *spatial)`` with 1=valid.
+
+    Instance norm (the common case) is fully vectorized via
+    :func:`_masked_instance_norm`.  Batch norm — and the rare ``reduce='max'``
+    instance case — fall back to feeding the valid voxels to e3nn's own forward
+    (batch norm pools over all valid voxels and keeps running-stat semantics).
+    """
+    if getattr(norm, 'instance', False) and norm.reduce == 'mean':
+        return _masked_instance_norm(norm, x, mask)
+
+    dt = x.dtype
+    xc = x.permute(0, 2, 3, 4, 1).contiguous()   # (B, *spatial, C)
+    m = mask[:, 0] > 0                            # (B, *spatial)
+    if not bool(m.any()):
+        return x
+    if getattr(norm, 'instance', False):
+        parts = []
+        for b in range(x.shape[0]):
+            sel = m[b]
+            if bool(sel.any()):
+                parts.append(norm(xc[b][sel].unsqueeze(0)).squeeze(0).to(dt))
+        normed = torch.cat(parts, 0)
+    else:
+        normed = norm(xc[m].unsqueeze(0)).squeeze(0).to(dt)
+    mexp = m.unsqueeze(-1).expand_as(xc)
+    out = xc.masked_scatter(mexp, normed.reshape(-1))
+    return out.permute(0, 4, 1, 2, 3)
+
+
 class NormSoftClamp(nn.Module):
     """Self-normalizing activation for l>0 irrep features.
 
@@ -620,13 +705,16 @@ class VoxelConvolution(nn.Module):
         )
         return self.sc(identity).T
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """Forward pass.
 
         Parameters
         ----------
         x : torch.Tensor
             Input tensor of shape (batch, irreps_in.dim, x, y, z)
+        mask : torch.Tensor, optional
+            Validity mask (batch, 1, x, y, z), 1=valid. Masked voxels are
+            censored (contribute 0); see ``_mask_renorm`` for boundary rescale.
 
         Returns
         -------
@@ -640,37 +728,43 @@ class VoxelConvolution(nn.Module):
 
         _ss = self._spacing_scale
 
+        # Masking: zero out masked-input voxels so they contribute exactly 0 to
+        # every output (true censoring — identical to submanifold sparse conv).
+        # The mask is applied once here and reused for the self-connection.
+        if mask is not None:
+            x = x * mask
+
         if self.sc_mode == "none":
             # No self-connection: cutoff=False ensures center weight is nonzero
             if is_1x1x1 and self.cutoff:
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
-            return F.conv3d(x, self.kernel(_ss), **self.kwargs)
+            out = F.conv3d(x, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "sc_first":
             sc = self.sc(x.transpose(1, 4)).transpose(1, 4)
             if is_1x1x1:
                 return sc
-            return F.conv3d(sc, self.kernel(_ss), **self.kwargs)
+            out = F.conv3d(sc, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "sc_first_res":
             sc = self.sc(x.transpose(1, 4)).transpose(1, 4)
             if is_1x1x1:
                 return sc
-            return sc + F.conv3d(sc, self.kernel(_ss), **self.kwargs)
+            out = sc + F.conv3d(sc, self.kernel(_ss), **self.kwargs)
         elif self.sc_mode == "conv_first":
             if is_1x1x1:
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
             conv_out = F.conv3d(x, self.kernel(_ss), **self.kwargs)
-            return self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
+            out = self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
         elif self.sc_mode == "conv_first_res":
             if is_1x1x1:
                 b = x.shape[0]
                 spatial = x.shape[2:]
                 return x.new_zeros(b, self.irreps_out.dim, *spatial)
             conv_out = F.conv3d(x, self.kernel(_ss), **self.kwargs)
-            return conv_out + self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
+            out = conv_out + self.sc(conv_out.transpose(1, 4)).transpose(1, 4)
         else:
             # Parallel: fuse sc weights into kernel center.
             sc_w = self._sc_weight_matrix()  # (out_dim, in_dim)
@@ -683,16 +777,38 @@ class VoxelConvolution(nn.Module):
             # Differentiable center injection: broadcast sc_w into a
             # kernel-shaped tensor that is nonzero only at the center,
             # then add to the spatial kernel.
-            mask = kernel.new_zeros(kernel.shape[2:])
-            mask[cx, cy, cz] = 1.0
+            center = kernel.new_zeros(kernel.shape[2:])
+            center[cx, cy, cz] = 1.0
             if self.sphere_norm:
                 # Scale sc_w by kernel voxel count (inside radius) to match
                 # the normalization applied to convolution weights in kernel().
                 n_voxels = self._n_kernel_voxels()
-                kernel = kernel + (sc_w[:, :, None, None, None] / n_voxels) * mask
+                kernel = kernel + (sc_w[:, :, None, None, None] / n_voxels) * center
             else:
-                kernel = kernel + sc_w[:, :, None, None, None] * mask
-            return F.conv3d(x, kernel, **self.kwargs)
+                kernel = kernel + sc_w[:, :, None, None, None] * center
+            out = F.conv3d(x, kernel, **self.kwargs)
+
+        # Partial-convolution renormalization: rescale each output voxel by the
+        # fraction of its kernel sphere that was valid, so boundary activations
+        # keep interior-level magnitude.  A single per-voxel scalar -> equivariant.
+        # Off by default (renorm preserves magnitude; off matches the sparse
+        # backend's censoring exactly).
+        if mask is not None and getattr(self, '_mask_renorm', False) and not is_1x1x1:
+            out = out * self._valid_fraction_renorm(mask)
+        return out
+
+    def _valid_fraction_renorm(self, mask):
+        """Per-voxel renorm scalar = (kernel sphere size) / (valid voxels in it).
+
+        Counts valid voxels inside the kernel radius at each position via a conv
+        of the mask with the sphere-indicator kernel, using the same padding as
+        the main conv so the result aligns.  Returns ``(B, 1, *spatial)``.
+        """
+        sphere = (self.lattice.float().norm(dim=-1) <= self.diameter / 2)
+        sk = sphere.to(mask.dtype).view(1, 1, *sphere.shape)
+        n = float(sphere.sum().clamp_min(1))
+        valid = F.conv3d(mask, sk, padding=self.kwargs['padding'])
+        return n / valid.clamp_min(1.0)
 
 
 class PyramidVoxelConvolution(VoxelConvolution):
@@ -1220,23 +1336,43 @@ class EquivariantPool3d(nn.Module):
         self.steps = steps
         self.kernel_size = tuple(_pool_factor(self.scale, s) for s in self.steps)
 
-    def forward(self, x):
-        if self.mode == 'maxpool3d':
-            return self._equivariant_max_pool(x)
-        elif self.mode == 'average':
-            return F.avg_pool3d(x, self.kernel_size, stride=self.kernel_size)
+    def forward(self, x, mask=None):
+        if mask is None:
+            if self.mode == 'maxpool3d':
+                return self._equivariant_max_pool(x)
+            elif self.mode == 'average':
+                return F.avg_pool3d(x, self.kernel_size, stride=self.kernel_size)
+            else:
+                raise ValueError(f"Unknown pooling mode: {self.mode}")
+
+        # Masked pooling: only valid voxels contribute; returns the downsampled
+        # mask (a pooled voxel is valid iff any of its children are valid).
+        ks = self.kernel_size
+        pooled_mask = F.max_pool3d(mask, ks, stride=ks)
+        if self.mode == 'average':
+            num = F.avg_pool3d(x * mask, ks, stride=ks)
+            den = F.avg_pool3d(mask, ks, stride=ks).clamp_min(1e-6)
+            pooled = num / den
+        elif self.mode == 'maxpool3d':
+            pooled = self._equivariant_max_pool(x, mask=mask)
         else:
             raise ValueError(f"Unknown pooling mode: {self.mode}")
+        # Zero fully-masked output voxels (keeps sentinels out of downstream ops).
+        pooled = pooled * pooled_mask
+        return pooled, pooled_mask
 
-    def _equivariant_max_pool(self, x):
+    def _equivariant_max_pool(self, x, mask=None):
         """Vectorized equivariant max pooling.
 
         Processes all instances of each irrep type in a single batched op
-        instead of looping per-instance.
+        instead of looping per-instance.  With ``mask`` given, masked voxels are
+        excluded from the max (scalars and l>0 norm-argmax alike).
         """
         assert x.shape[1] == self.irreps.dim, "Shape mismatch"
         B = x.shape[0]
         spatial = x.shape[2:]
+        mvalid = (mask > 0) if mask is not None else None  # (B, 1, D, H, W)
+        neg = torch.finfo(x.dtype).min
 
         results = []
         start = 0
@@ -1247,9 +1383,11 @@ class EquivariantPool3d(nn.Module):
 
             if ir.l == 0:
                 # All scalars at once: (B, mul, D, H, W) — standard max pool
+                xs = x[:, start:end, ...]
+                if mvalid is not None:
+                    xs = xs.masked_fill(~mvalid, neg)
                 pooled = F.max_pool3d(
-                    x[:, start:end, ...],
-                    self.kernel_size, stride=self.kernel_size,
+                    xs, self.kernel_size, stride=self.kernel_size,
                 )
                 results.append(pooled)
             else:
@@ -1258,6 +1396,10 @@ class EquivariantPool3d(nn.Module):
 
                 # Pool on norms: (B, mul, D, H, W) → (B, mul, D', H', W')
                 norms = feat.norm(dim=2)
+                if mvalid is not None:
+                    # Masked voxels get norm < any valid norm (>=0) so they are
+                    # never selected unless the whole window is masked.
+                    norms = norms.masked_fill(~mvalid, -1.0)
                 _, indices = F.max_pool3d_with_indices(
                     norms, self.kernel_size, stride=self.kernel_size,
                     return_indices=True,
@@ -1659,19 +1801,34 @@ class ConvolutionBlock(nn.Module):
         self.conv1.update_spacing(steps)
         self.conv2.update_spacing(steps)
 
-    def forward(self, x):
+    def _norm(self, bn, x, mask):
+        """Normalize, masking over valid voxels when a mask is given.
+
+        Instance norm (the default) always uses the vectorized channel-first
+        path — leaner than e3nn's transpose-based forward — whether or not a
+        mask is present.  Batch norm with a mask uses the valid-voxel fallback;
+        everything else uses e3nn's stock forward.
+        """
+        dtype = x.dtype
+        if isinstance(bn, BatchNorm) and bn.instance and bn.reduce == 'mean':
+            return _masked_instance_norm(bn, x, mask)
+        if mask is not None and isinstance(bn, BatchNorm):
+            return _masked_e3nn_batchnorm(bn, x, mask)
+        return bn(x.transpose(1, 4)).to(dtype).transpose(1, 4)
+
+    def forward(self, x, mask=None):
         dtype = x.dtype
         # First conv block
-        x = self.conv1(x)
-        x = self.batchnorm1(x.transpose(1, 4)).to(dtype).transpose(1, 4)
+        x = self.conv1(x, mask=mask)
+        x = self._norm(self.batchnorm1, x, mask)
         x = self.gate1(x.transpose(1, 4)).to(dtype).transpose(1, 4)
         if self.norm_selu1 is not None:
             x = self.norm_selu1(x.transpose(1, 4)).transpose(1, 4)
         x = self.dropout1(x.transpose(1, 4)).transpose(1, 4)
 
         # Second conv block
-        x = self.conv2(x)
-        x = self.batchnorm2(x.transpose(1, 4)).to(dtype).transpose(1, 4)
+        x = self.conv2(x, mask=mask)
+        x = self._norm(self.batchnorm2, x, mask)
         x = self.gate2(x.transpose(1, 4)).to(dtype).transpose(1, 4)
         if self.norm_selu2 is not None:
             x = self.norm_selu2(x.transpose(1, 4)).transpose(1, 4)
@@ -1881,19 +2038,33 @@ class Encoder(nn.Module):
         for i, pool in enumerate(self.down_pool):
             pool.update_spacing(steps_array[i])
 
-    def forward(self, x):
-        """Returns list of features at each level."""
+    def forward(self, x, mask=None):
+        """Returns list of features at each level.
+
+        If ``mask`` (B, 1, *spatial) is given, also returns the list of masks at
+        each level so the decoder can censor-match each skip. ``s2d`` pooling
+        does not support masking.
+        """
         features = []
+        masks = []
 
         for i, block in enumerate(self.down_blocks):
-            x = block(x)
+            x = block(x, mask=mask)
             features.append(x)
+            masks.append(mask)
             if i < len(self.down_blocks) - 1:
-                x = self.down_pool[i](x)
+                if mask is None:
+                    x = self.down_pool[i](x)
+                else:
+                    if self.down_proj is not None:
+                        raise NotImplementedError("masking is not supported with s2d pooling")
+                    x, mask = self.down_pool[i](x, mask=mask)
                 if self.down_proj is not None:
                     # e3nn Linear expects channel-last; data is channel-first
                     x = self.down_proj[i](x.transpose(1, 4)).transpose(1, 4)
 
+        if mask is not None or masks[0] is not None:
+            return features, masks
         return features
 
 
@@ -2027,8 +2198,12 @@ class Decoder(nn.Module):
             )
             self.upsample_ops[i].scale_factor = scale_factor
 
-    def forward(self, x, encoder_features):
+    def forward(self, x, encoder_features, encoder_masks=None):
         """Forward pass with skip connections from encoder.
+
+        ``encoder_masks`` (per-level validity masks from a masked Encoder) censor
+        each decoder block: the block at level i uses the mask at its skip's
+        resolution, so masked voxels never contribute and norms exclude them.
 
         Returns
         -------
@@ -2042,6 +2217,7 @@ class Decoder(nn.Module):
         for i in range(self.n_blocks):
             x = self.upsample_ops[i](x)
             skip = encoder_features[::-1][i + 1]
+            mask = encoder_masks[::-1][i + 1] if encoder_masks is not None else None
             if x.shape[2:] != skip.shape[2:]:
                 raise RuntimeError(
                     f"Decoder level {i}: upsampled shape {x.shape[2:]} != "
@@ -2051,7 +2227,7 @@ class Decoder(nn.Module):
                     f"all encoder shapes={[f.shape for f in encoder_features]}"
                 )
             x = torch.cat([x, skip], dim=1)
-            x = self.up_blocks[i](x)
+            x = self.up_blocks[i](x, mask=mask)
 
             # Collect deep supervision outputs (all but last level)
             if self.deep_supervision and self.ds_heads is not None and i < self.n_blocks - 1:

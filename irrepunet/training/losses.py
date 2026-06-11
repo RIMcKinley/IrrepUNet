@@ -32,7 +32,8 @@ class DiceLoss(nn.Module):
         self.include_background = include_background
         self.batch_dice = batch_dice
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -41,6 +42,9 @@ class DiceLoss(nn.Module):
         target : torch.Tensor
             Target labels of shape (B, D, H, W) with class indices
             or (B, C, D, H, W) one-hot encoded
+        mask : torch.Tensor, optional
+            Binary validity mask of shape (B, D, H, W) (1 = count this voxel).
+            Excluded voxels contribute 0 to both intersection and union.
 
         Returns
         -------
@@ -54,6 +58,11 @@ class DiceLoss(nn.Module):
         if target.ndim == pred.ndim - 1:
             target = F.one_hot(target.long(), num_classes=pred.shape[1])
             target = target.permute(0, 4, 1, 2, 3).float()
+
+        if mask is not None:
+            m = mask.unsqueeze(1).to(pred.dtype)  # (B, 1, D, H, W)
+            pred = pred * m
+            target = target * m
 
         if self.batch_dice:
             # Reduce over batch and spatial dims — biases toward large volumes
@@ -104,7 +113,8 @@ class DiceCELoss(nn.Module):
                                   batch_dice=batch_dice)
         self.ce_loss = nn.CrossEntropyLoss()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -112,14 +122,22 @@ class DiceCELoss(nn.Module):
             Predictions of shape (B, C, D, H, W)
         target : torch.Tensor
             Target labels of shape (B, D, H, W)
+        mask : torch.Tensor, optional
+            Binary validity mask (B, D, H, W); excluded voxels are ignored by
+            both the Dice and cross-entropy terms.
 
         Returns
         -------
         torch.Tensor
             Combined loss value
         """
-        dice = self.dice_loss(pred, target)
-        ce = self.ce_loss(pred, target.long())
+        dice = self.dice_loss(pred, target, mask=mask)
+        if mask is None:
+            ce = self.ce_loss(pred, target.long())
+        else:
+            ce_vox = F.cross_entropy(pred, target.long(), reduction='none')  # (B,D,H,W)
+            m = mask.to(ce_vox.dtype)
+            ce = (ce_vox * m).sum() / m.sum().clamp_min(1.0)
         return self.dice_weight * dice + self.ce_weight * ce
 
 
@@ -158,7 +176,8 @@ class DeepSupervisionLoss(nn.Module):
     def forward(
         self,
         preds: list,
-        targets: list
+        targets: list,
+        masks: list = None
     ) -> torch.Tensor:
         """
         Parameters
@@ -167,6 +186,8 @@ class DeepSupervisionLoss(nn.Module):
             Predictions at each scale, from coarsest to finest
         targets : list of torch.Tensor
             Target labels at each scale, from coarsest to finest
+        masks : list of torch.Tensor, optional
+            Per-scale validity masks (same ordering as preds/targets).
 
         Returns
         -------
@@ -186,8 +207,9 @@ class DeepSupervisionLoss(nn.Module):
             weights = [w / w_sum for w in weights]
 
         total_loss = 0.0
-        for pred, target, weight in zip(preds, targets, weights):
-            loss = self.base_loss(pred, target)
+        for i, (pred, target, weight) in enumerate(zip(preds, targets, weights)):
+            mask = masks[i] if masks is not None else None
+            loss = self.base_loss(pred, target, mask=mask)
             total_loss = total_loss + weight * loss
 
         return total_loss

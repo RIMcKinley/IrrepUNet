@@ -85,6 +85,7 @@ class E3nnUNet(nn.Module):
         spacing: tuple = (1.0, 1.0, 1.0),
         normalization: str = 'instance',
         n_base_filters: int = 2,
+        n_base_odd: int = None,
         n_downsample: int = 2,
         equivariance: str = 'SO3',
         lmax: int = 2,
@@ -107,6 +108,7 @@ class E3nnUNet(nn.Module):
         sphere_norm: bool = True,
         backend: str = "e3nn",
         pyramid=False,
+        mask_renorm: bool = False,
     ):
         super().__init__()
 
@@ -119,6 +121,7 @@ class E3nnUNet(nn.Module):
         self.sphere_norm = sphere_norm
         self.backend = backend
         self.pyramid = pyramid
+        self.mask_renorm = mask_renorm
 
         # Store configuration for dynamic spacing rebuild
         self.default_spacing = spacing
@@ -175,7 +178,9 @@ class E3nnUNet(nn.Module):
             self.activation = [act_fn, torch.tanh]
             self.irreps_sh = Irreps.spherical_harmonics(lmax, -1)
             self.ne = n_base_filters
-            self.no = n_base_filters
+            # Allow asymmetric ne / no — defaults to ne when not specified.
+            self.no = n_base_filters if n_base_odd is None else n_base_odd
+        self.n_base_odd = n_base_odd
 
         # Input irreps (scalar input)
         self.input_irreps = Irreps(f"{in_channels}x0e")
@@ -349,13 +354,21 @@ class E3nnUNet(nn.Module):
 
         return pad
 
-    def forward(self, x, spacing=None, scales=None, spacing_scale=None):
+    def forward(self, x, spacing=None, scales=None, spacing_scale=None, mask=None):
         """Forward pass.
 
         Parameters
         ----------
         x : torch.Tensor
             Input tensor of shape (batch, channels, depth, height, width)
+        mask : torch.Tensor, optional
+            Binary validity mask of shape (B, D, H, W) or (B, 1, D, H, W).
+            Voxels where ``mask <= 0`` are censored: their inputs are zeroed
+            before every convolution so they never enter a valid voxel's
+            receptive field, and normalization excludes them. Their own outputs
+            are left undefined (use a matching loss mask to exclude them).
+            Optionally rescaled at boundaries when ``mask_renorm=True``.
+            ``None`` ⇒ every voxel active (plain dense path).
         spacing : tuple, optional
             Physical spacing for this batch. If provided and different from
             current spacing, the network will be rebuilt for this spacing.
@@ -382,24 +395,39 @@ class E3nnUNet(nn.Module):
         if spacing != self._current_spacing or scales is not None:
             self._rebuild_for_spacing(spacing, scales=scales)
 
-        # Propagate spacing_scale to all VoxelConvolution layers.
-        # This jitters kernel weights (SH/RBF) without changing kernel
-        # voxel size or pooling — a regularizer for spacing robustness.
+        # Normalize the mask to (B, 1, D, H, W) float and propagate the renorm
+        # flag to the conv layers (masked-dense path).
+        if mask is not None:
+            if mask.dim() == 4:
+                mask = mask.unsqueeze(1)
+            mask = mask.to(x.dtype)
+        renorm = mask is not None and self.mask_renorm
+
+        # Propagate spacing_scale (and the mask-renorm flag) to all
+        # VoxelConvolution layers.  spacing_scale jitters kernel weights (SH/RBF)
+        # without changing kernel voxel size or pooling.
         for m in self.modules():
             if hasattr(m, '_spacing_scale'):
                 m._spacing_scale = spacing_scale
+                m._mask_renorm = renorm
 
-        # Compute and apply padding
+        # Compute and apply padding (padded voxels are invalid → masked out).
         pad = self._compute_padding(x.shape[-3:])
         original_shape = x.shape[-3:]
         x = nn.functional.pad(x, (pad[-1], 0, pad[-2], 0, pad[-3], 0))
+        if mask is not None:
+            mask = nn.functional.pad(mask, (pad[-1], 0, pad[-2], 0, pad[-3], 0))
 
         # Encoder
-        encoder_features = self.encoder(x)
+        if mask is None:
+            encoder_features = self.encoder(x)
+            encoder_masks = None
+        else:
+            encoder_features, encoder_masks = self.encoder(x, mask)
 
         # Decoder
         try:
-            decoder_out = self.decoder(encoder_features[-1], encoder_features)
+            decoder_out = self.decoder(encoder_features[-1], encoder_features, encoder_masks)
         except RuntimeError as e:
             # Add spacing context to the error
             pool_factors = [
@@ -469,6 +497,7 @@ class E3nnUNet(nn.Module):
                 'diameter': self.diameter,
                 'num_radial_basis': self.num_radial_basis,
                 'n_base_filters': self.n_base_filters,
+                'n_base_odd': self.n_base_odd,
                 'n_downsample': self.n_downsample,
                 'equivariance': self.equivariance,
                 'lmax': self.lmax,
@@ -492,6 +521,7 @@ class E3nnUNet(nn.Module):
                 'sphere_norm': self.sphere_norm,
                 'backend': self.backend,
                 'pyramid': self.pyramid,
+                'mask_renorm': self.mask_renorm,
             },
         }
 
